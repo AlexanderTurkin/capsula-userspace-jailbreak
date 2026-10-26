@@ -66,8 +66,8 @@ fn u32le(d: &[u8], off: usize) -> u32 {
 /// as loader_wide2str in xrock.
 fn wide2str(raw: &[u8]) -> String {
     let mut s = String::new();
-    for pair in raw.chunks_exact(2) {
-        let c = pair[0];
+    let (pairs, _) = raw.as_chunks::<2>();
+    for &[c, _] in pairs {
         if !(0x20..=0x7e).contains(&c) || c == 0 {
             break;
         }
