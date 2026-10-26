@@ -155,6 +155,19 @@ impl NusbTransport {
     }
 }
 
+/// Maximum bytes per bulk-IN read request.
+///
+/// nusb enables the WinUSB RAW_IO pipe policy on bulk-IN endpoints,
+/// and RAW_IO requests are never split by WinUSB: anything above the
+/// host stack's maximum transfer size (2 MiB on common xHCI stacks;
+/// measured: 2 MiB passes, 3 MiB fails with ERROR_INVALID_FUNCTION =
+/// "usb: unknown (error 1)") fails instantly. Split larger reads into
+/// 1 MiB pieces. This is protocol-transparent: the data phase is a
+/// byte stream and the device does not see host request boundaries.
+/// Bulk-OUT needs no cap — WinUSB splits large OUT requests itself
+/// (RAW_IO is only set on IN endpoints by nusb).
+const BULK_IN_MAX: usize = 1024 * 1024;
+
 impl Transport for NusbTransport {
     fn control_out(&mut self, request: u8, value: u16, index: u16, data: &[u8]) -> Result<()> {
         self.interface
@@ -189,14 +202,16 @@ impl Transport for NusbTransport {
     }
 
     fn bulk_read(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<()> {
-        let ep = self
-            .interface
-            .endpoint::<nusb::transfer::Bulk, nusb::transfer::In>(endpoint)
-            .map_err(|e| Error::Usb(e.to_string()))?;
-        let mut reader = ep.reader(buf.len().max(512));
-        reader
-            .read_exact(buf)
-            .map_err(|e| Error::Usb(e.to_string()))?;
+        for chunk in buf.chunks_mut(BULK_IN_MAX) {
+            let ep = self
+                .interface
+                .endpoint::<nusb::transfer::Bulk, nusb::transfer::In>(endpoint)
+                .map_err(|e| Error::Usb(e.to_string()))?;
+            let mut reader = ep.reader(chunk.len().max(512));
+            reader
+                .read_exact(chunk)
+                .map_err(|e| Error::Usb(e.to_string()))?;
+        }
         Ok(())
     }
 }
