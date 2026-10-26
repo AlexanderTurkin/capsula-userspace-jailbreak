@@ -36,6 +36,7 @@ hex = "0.4"
 
 # userdata overlay: ext2/3/4 via lwext4 (compiled with cc, no runtime deps)
 ext4-lwext4 = "0.1"
+cc = "1"
 
 # network (OTA download; rustls, no OpenSSL)
 ureq = { version = "3", features = ["json"] }

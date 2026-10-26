@@ -669,6 +669,7 @@ name = "jb-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cc",
  "crc32fast",
  "ext4-lwext4",
  "hex",

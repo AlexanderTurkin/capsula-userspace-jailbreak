@@ -20,5 +20,8 @@ hex = { workspace = true }
 ureq = { workspace = true }
 ext4-lwext4 = { workspace = true }
 
+[build-dependencies]
+cc = { workspace = true }
+
 [dev-dependencies]
 # integration tests use the same dependencies as the lib
