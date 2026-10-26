@@ -114,9 +114,11 @@ impl Gpt {
             let first = u64le(e, 32);
             let last = u64le(e, 40);
             let name_raw: Vec<u16> = e[56..128]
-                .chunks_exact(2)
-                .take_while(|c| c != &[0, 0])
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .take_while(|c| **c != [0, 0])
+                .map(|c| u16::from_le_bytes(*c))
                 .collect();
             let name = String::from_utf16(&name_raw).unwrap_or_default();
             let idx = (i + 1) as u32;
