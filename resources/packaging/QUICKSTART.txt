@@ -1,9 +1,10 @@
 capsula-jb — quick start
 ========================
 
-1. Windows only: do the USB driver setup in DRIVER-SETUP.txt first
-   (toggle the board to WinUSB with the bundled zadig-2.9.exe; you can
-   switch back to the vendor driver for RKDevTool at any time).
+1. No setup is needed: on Windows capsula-jb installs and maintains the
+   WinUSB driver binding itself (one UAC prompt may appear the first
+   time; see DRIVER-SETUP.txt only if something unusual happens, or to
+   switch the board back to the vendor driver for RKDevTool).
    macOS note: if the binary is blocked after downloading, run
    `xattr -d com.apple.quarantine capsula-jb` (or see README).
    Linux note: for access without root, see the udev rules in README.

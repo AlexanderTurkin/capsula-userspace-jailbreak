@@ -18,3 +18,6 @@ log = { workspace = true }
 env_logger = { workspace = true }
 clap = { workspace = true }
 indicatif = { workspace = true }
+# WinUSB driver management (Zadig-generated packages); no-op stubs on
+# non-Windows, so it is an unconditional dependency
+win-drv = { workspace = true }

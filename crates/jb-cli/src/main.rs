@@ -61,11 +61,23 @@ enum Command {
     Backup,
     /// Live log of 2207:* USB events
     Monitor,
+    /// (internal) elevated WinUSB driver helper, spawned via UAC
+    #[command(name = win_drv::HELPER_ARG, hide = true)]
+    WinDrvHelper {
+        /// done-file path: the helper exits when it appears
+        done: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
+    match cli.command {
+        Some(Command::WinDrvHelper { done }) => {
+            std::process::exit(win_drv::helper_main(&done));
+        }
+        _ => {}
+    }
     let wait = if cli.wait == 0 {
         None
     } else {
@@ -75,6 +87,7 @@ fn main() -> anyhow::Result<()> {
         None => run_jailbreak(wait, cli.yes, cli.format_userdata),
         Some(Command::Backup) => run_backup(wait),
         Some(Command::Monitor) => monitor(),
+        Some(Command::WinDrvHelper { .. }) => unreachable!("handled above"),
     }
 }
 
@@ -102,9 +115,56 @@ fn ensure_loader(config: &Config) -> anyhow::Result<LoaderContainer> {
     Ok(container)
 }
 
-/// Steps 1-3: loader, device, full dump into backup/. Returns the live
-/// usbplug session (usable for the subsequent write).
-fn dump_all(wait: Option<Duration>) -> anyhow::Result<rockusb::LoaderSession<NusbTransport>> {
+/// Steps 1-3: loader, device, full dump into backup/, with automatic
+/// WinUSB driver supervision on Windows. Returns the live usbplug
+/// session (usable for the subsequent write).
+///
+/// On Windows the board hops between devnodes (330d loader, 330e
+/// MaskROM/usbplug) and a fresh devnode may be grabbed by a vendor
+/// Rockusb driver before our WinUSB package gets it; when that
+/// happens the session rebinds the node and the bring-up — which is a
+/// re-entrant state machine over the current bus state — is retried.
+fn dump_all(
+    wait: Option<Duration>,
+    drivers: &mut win_drv::Session,
+) -> anyhow::Result<rockusb::LoaderSession<NusbTransport>> {
+    if win_drv::any_rockchip_node_misbound() {
+        println!("a Rockchip device is present without WinUSB — installing the driver (accept the UAC prompt)");
+        if let Err(e) = drivers.ensure_supervision() {
+            println!(
+                "warning: {e}; continuing, but a manual Zadig pass may be needed\n\
+                 (see DRIVER-SETUP.txt; session log: {})",
+                drivers.log_path().display()
+            );
+        } else if !win_drv::wait_until_bound(Duration::from_secs(30)) {
+            println!("warning: the driver did not settle in 30 s; continuing anyway");
+        }
+    }
+
+    const ATTEMPTS: u32 = 4;
+    for attempt in 1..=ATTEMPTS {
+        match dump_all_once(wait) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                if attempt < ATTEMPTS && win_drv::chain_is_binding_error(&e) {
+                    println!(
+                        "device node caught a non-WinUSB driver (attempt {attempt}/{ATTEMPTS}) — rebinding and retrying"
+                    );
+                    if let Err(e2) = drivers.ensure_supervision() {
+                        println!("warning: {e2}");
+                    }
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+    unreachable!("the retry loop always returns")
+}
+
+/// One bring-up + dump attempt (no retries).
+fn dump_all_once(wait: Option<Duration>) -> anyhow::Result<rockusb::LoaderSession<NusbTransport>> {
     let config = Config::embedded();
     let loader = ensure_loader(&config)?;
 
@@ -123,14 +183,16 @@ fn dump_all(wait: Option<Duration>) -> anyhow::Result<rockusb::LoaderSession<Nus
 
 /// `capsula-jb backup`: dump only.
 fn run_backup(wait: Option<Duration>) -> anyhow::Result<()> {
-    let _session = dump_all(wait)?;
+    let mut drivers = win_drv::Session::new();
+    let _session = dump_all(wait, &mut drivers)?;
     println!("done: dumps are in backup/ (nothing was written to the device)");
     Ok(())
 }
 
 /// Full jailbreak scenario (steps 1-6).
 fn run_jailbreak(wait: Option<Duration>, yes: bool, format_userdata: bool) -> anyhow::Result<()> {
-    let mut s = dump_all(wait)?;
+    let mut drivers = win_drv::Session::new();
+    let mut s = dump_all(wait, &mut drivers)?;
 
     // step 4: overlay on top of the userdata dump
     let store = BackupStore::open(Path::new("backup")).context("no valid backup in backup/")?;

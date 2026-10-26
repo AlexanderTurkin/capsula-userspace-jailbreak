@@ -22,6 +22,30 @@
   Windows-таргетах (`/STACK:8388608`). Парсинг OTA-манифеста рекурсивен
   и требует больше дефолтного для MSVC-линкера 1 МиБ — конфиг не
   удалять и не занижать.
+- `BULK_IN_MAX` в `rockusb/src/transport.rs` (1 МиБ) — потолок одного
+  bulk-IN запроса на Windows: nusb включает RAW_IO, и WinUSB не дробит
+  RAW_IO-запросы — всё выше maximum transfer size хост-стека (замерено:
+  2 МиБ проходит, 3 МиБ падает с `usb: unknown (error 1)`) отклоняется
+  мгновенно. Проверить потолок на новом железе:
+  `cargo run -p jb-core --example readsize --release`.
+- Файлы в `resources/drivers/winusb/` (INF+CAT+CER) — подписанные
+  артефакты Zadig/libwdi: каталог подписывает ровно этот INF, поэтому
+  их нельзя переименовывать и править (включая DriverVer). Новый PID =
+  новый пакет против живого устройства — процедура в
+  `resources/drivers/winusb/README.md`.
+
+## win-drv (Windows-драйверы)
+
+Крейт `crates/win-drv` держит плату на WinUSB без ручного Zadig:
+пакеты зашиты в бинарник, сертификаты ставятся в ROOT/TrustedPublisher,
+привязка — `UpdateDriverForPlugAndPlayDevices` с FORCE (тот же newdev
+API, что у Zadig), сессия следит за шиной и перевязывает узлы,
+перехваченные вендорским Rockusb. Из непривилегированного процесса
+работает скрытая подкоманда-хелпер (`capsula-jb __win-drv-helper`),
+поднимаемая через UAC; из повышенного — инлайн-поток. Живой тест:
+удалить libwdi-пакеты (`pnputil /delete-driver oemNN.inf /uninstall
+/force`), вернуть вендорский, запустить `capsula-jb backup` —
+сценарий должен сам дойти до «reading GPT».
 
 ## adbd
 

@@ -4,10 +4,11 @@ members = [
     "crates/rockusb",
     "crates/jb-core",
     "crates/jb-cli",
+    "crates/win-drv",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/LibreCapsula/capsula-userspace-jailbreak"
@@ -16,6 +17,7 @@ repository = "https://github.com/LibreCapsula/capsula-userspace-jailbreak"
 # internal
 rockusb = { path = "crates/rockusb" }
 jb-core = { path = "crates/jb-core" }
+win-drv = { path = "crates/win-drv" }
 
 # usb / protocol
 nusb = "0.2"

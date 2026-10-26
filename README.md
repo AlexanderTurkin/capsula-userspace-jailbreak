@@ -24,12 +24,14 @@ Windows, macOS): Rockchip USB-протоколы, форматы OTA и ext2/3/4
 дополнительно вложены Zadig и официальный установщик USB-драйверов
 Rockchip.
 
-- **Windows**: распакуйте архив и настройте USB-драйвер по
-  `DRIVER-SETUP.txt`: capsula-jb открывает плату через WinUSB —
-  переключите её вложенным `zadig-2.9.exe`; вендорский драйвер Rockusb
-  (он нужен RKDevTool/upgrade_tool) ставится из
-  `RockchipUSBDriver.zip` и возвращается теми же шагами. Затем
-  запускайте `capsula-jb.exe`.
+- **Windows**: распакуйте архив и запускайте `capsula-jb.exe` — USB-драйверы
+  ставятся автоматически: инструмент сам устанавливает WinUSB-пакеты
+  (сгенерированные Zadig/libwdi, зашиты в бинарник), сам перевязывает
+  плату на каждом смене её USB-личины (лоадер 330d, MaskROM/usbplug
+  330e) и сам побеждает вендорский драйвер Rockusb, если тот
+  установлен. При первом запуске может появиться один запрос UAC.
+  Ручной режим (Zadig из архива) и переключение обратно на вендорский
+  драйвер для RKDevTool — в `DRIVER-SETUP.txt`.
 - **macOS**: если бинарник заблокирован Gatekeeper после скачивания
   браузером — `xattr -d com.apple.quarantine capsula-jb`.
 - **Linux**: для работы без root установите udev-правила (см. Полезное).
@@ -187,10 +189,14 @@ crates/
               Нативный порт xrock поверх nusb; транспорт мокается.
   jb-core/    Домен: конфигурация, GPT, дамп (RAM-патч 0xCC),
               OTA/RKFW, оверлей userdata (ext4-lwext4), запись раздела.
+  win-drv/    Windows: автоматическая установка/перевязка WinUSB
+              (Zadig-пакеты зашиты в бинарник; elevated-хелпер, UAC).
   jb-cli/     capsula-jb — CLI.
 resources/
   config.toml Общая конфигурация: код OTA, константы RAM-патча usbplug,
               подсказки по входу в download-режим.
+  drivers/    WinUSB-пакеты (INF+CAT+CER, сгенерированы Zadig/libwdi)
+              для 330D и 330E — вшиваются в бинарник крейтом win-drv.
   overlay/    adbd + флаг USB-гаджета (вшиваются в userdata).
 ```
 
@@ -202,7 +208,9 @@ resources/
 Зависимость `ext4-lwext4` компилирует C-библиотеку lwext4 через `cc`
 (нужен C-компилятор при сборке), рантайм-зависимостей нет. Лицензия
 обвязки — MIT/Apache-2.0; флаги `gpl*` самой библиотеки не
-используются.
+используются. WinUSB-пакеты в `resources/drivers/` сгенерированы
+Zadig/libwdi (LGPL, Pete Batard) — условия те же, что и для вложенного
+в архивы `zadig-2.9.exe`; см. `resources/drivers/winusb/README.md`.
 
 ## Лицензия
 
