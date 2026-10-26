@@ -36,8 +36,15 @@ case "$ARCHIVE" in
         tar -C staging -czf "dist/${name}.tar.gz" "${name}"
         ;;
     zip)
-        # bsdtar (macOS/Windows runners) picks the format by extension
-        tar -C staging -a -cf "dist/${name}.zip" "${name}"
+        if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]]; then
+            # Windows: Compress-Archive (bsdtar -a produces zips that
+            # unzip flags as having stray leading bytes)
+            powershell.exe -NoProfile -Command \
+                "Compress-Archive -Path 'staging/${name}' -DestinationPath 'dist/${name}.zip'"
+        else
+            # macOS bsdtar picks the format by extension
+            tar -C staging -a -cf "dist/${name}.zip" "${name}"
+        fi
         ;;
 esac
 
