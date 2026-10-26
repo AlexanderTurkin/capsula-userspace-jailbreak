@@ -16,8 +16,11 @@ if [[ "$TARGET" == *-windows-* ]]; then
     bin="${bin}.exe"
 fi
 cp "$bin" "${stage}/"
-cp README.md LICENSE AGENTS.md "${stage}/"
+cp README.md LICENSE "${stage}/"
 cp resources/packaging/QUICKSTART.txt "${stage}/"
+# Agent manual for flashing (the root AGENTS.md is the dev guide and
+# intentionally does not ship).
+cp resources/packaging/AGENTS.md "${stage}/"
 
 case "$TARGET" in
     *-windows-*)

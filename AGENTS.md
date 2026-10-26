@@ -1,68 +1,50 @@
-# AGENTS.md — инструкция для LLM-агентов
+# AGENTS.md — инструкция для LLM-агентов: разработка
 
-Правила работы с этим инструментом при помощи пользователя. Кратко о
-сути: capsula-jb переписывает единственный раздел флеша (userdata) и
-меняет драйверы USB на Windows — оба действия делаются только с явного
-согласия пользователя.
+Инструкция по прошивке колонки для конечного пользователя — отдельный
+файл `resources/packaging/AGENTS.md`; он же кладётся в релизные
+архивы. Этот файл — о работе над репозиторием.
 
-## Подтверждение записи на устройство
+## Сборка и тесты
 
-Перед записью userdata инструмент печатает `proceed? [y/N]`. При
-неинтерактивном stdin (CI, агент) он завершается ошибкой, ничего не
-записав. Получив такую ошибку, согласуйте запись с пользователем и
-перезапустите с `--yes`. **Никогда не добавляйте `--yes` по своей
-инициативе.** `capsula-jb backup` ничего не пишет и подтверждений не
-спрашивает.
+- `cargo build --release` — нужен Rust и C-компилятор (lwext4
+  собирается через `cc`).
+- `cargo test --workspace` — тесты userdata гоняют настоящий lwext4 на
+  синтетических образах и сериализованы общим мьютексом (у lwext4
+  глобальное состояние); протокольные тесты работают на MockTransport,
+  без железа. Единственный тест с реальными данными скачивает OTA с
+  VK CDN в момент запуска и выключен по умолчанию (см. tests/README.md).
+- Бинарные образцы прошивок в репозитории не хранятся и не
+  распространяются.
 
-## USB-драйвер на Windows: тумблер Zadig ↔ Rockusb
+## Ограничения, которые нельзя ломать
 
-capsula-jb открывает плату через **WinUSB**. Официальные утилиты
-(RKDevTool, upgrade_tool, FactoryTool) работают через вендорский
-**Rockusb**, который ставит DriverAssistant из `RockchipUSBDriver.zip`.
-Windows разрешает устройству один драйвер — это тумблер, а не
-одноразовая установка.
+- `.cargo/config.toml` резервирует 8 МиБ стека главного потока на
+  Windows-таргетах (`/STACK:8388608`). Парсинг OTA-манифеста рекурсивен
+  и требует больше дефолтного для MSVC-линкера 1 МиБ — конфиг не
+  удалять и не занижать.
 
-**Диагностика.** `capsula-jb monitor` лишь перечисляет шину и видит
-плату при любом драйвере — это НЕ способ проверить драйвер. Симптом
-«rockchip device not found» при видимой в monitor плате означает: на
-устройстве не WinUSB. Проверка привязки:
+## adbd
 
-```powershell
-Get-PnpDevice | Where-Object { $_.InstanceId -match 'VID_2207&PID_330D' } |
-  Get-PnpDeviceProperty -KeyName DEVPKEY_Device_Service | Format-List KeyName,Data
+Оверлейный `adbd` собирается герметично в контейнере (Debian bullseye,
+кросс-тулчейн, стоковый ABI glibc ≤ 2.33 / libcrypto 1.1):
+
+```sh
+docker build -t capsula-adbd docker/adbd
+docker run --rm -v docker/adbd:/work capsula-adbd /work/build.sh
 ```
 
-`Data: Rockusb` — вендорский драйвер; `Data: WinUSB` — готово к
-capsula-jb. Для 330E (вторая ревизия лоадера) то же самое.
+## Релизы
 
-**Включение WinUSB (Zadig).** `zadig-2.9.exe` лежит в Windows-архиве
-релиза (или официальный libwdi v1.5.1; подпись CN=Akeo Consulting).
-Замена драйвера — системное действие: **агент не выполняет его сам и не
-ставит драйверы молча.** Попросите пользователя: Options → List All
-Devices → устройство с USB ID `2207:330D` → выбрать WinUSB → Replace
-Driver. Затем проверьте привязку PowerShell-командой выше.
+Тег `v*` запускает `.github/workflows/release.yml`: сборка adbd в
+Docker → матрица из 5 платформ → публикация GitHub Release.
 
-**Возврат к Rockusb (для RKDevTool и др.).** Zadig создаёт INF,
-привязанный к серийнику конкретной платы, — такой матч ранжируется
-выше генерического INF вендора, поэтому перезапуск DriverAssistant
-плату НЕ вернёт. Попросите пользователя в Device Manager: Uninstall
-device (с галкой «Attempt to remove the driver for this device») →
-Scan for hardware changes — плата встанет обратно на вендорский Rockusb
-(пакет DriverAssistant должен стоять). Проверьте: `Data: Rockusb`.
-
-**Нюансы.** Привязка per-serial — тумблер действует на конкретную
-плату, не на все устройства 2207. Не переключайте драйвер, пока
-RKDevTool или capsula-jb держит устройство открытым. После джейлбрейка
-adb по USB (гаджет `2207:0006`) потребует WinUSB-классного драйвера и
-для самого adb; adb по Wi-Fi (`adb connect <ip>:5555`) не требует
-ничего.
-
-## Диагностика старых Windows-релизов (≤ v0.1.0)
-
-`thread 'main' has overflowed its stack` сразу после «querying latest
-firmware» — известный баг: в PE-заголовке релизов до фикса главному
-потоку отведено 1 МиБ стека (дефолт MSVC-линкера), на Linux/macOS —
-8 МиБ. Исправлено в `.cargo/config.toml` (`/STACK:8388608`). Обход для
-старого бинарника без пересборки: в PE-заголовке (PE32+, смещение
-`e_lfanew + 4 + 20 + 0x48`) перезаписать `SizeOfStackReserve` на
-`0x800000` — после этого тот же exe работает.
+- В Windows-архив вкладываются `RockchipUSBDriver.zip` (вендорский
+  драйвер Rockusb для официальных утилит) и `zadig-2.9.exe` (перевод
+  платы на WinUSB для capsula-jb). Оба пинуются SHA256 в env
+  воркфлоу: при обновлении upstream обновляйте пин, при изменении
+  суммы сборка падает, а не катит непроверенный бинарник.
+- В каждый архив кладутся `resources/packaging/QUICKSTART.txt`,
+  `resources/packaging/AGENTS.md` (инструкция для агентов по прошивке)
+  и, для Windows, `resources/packaging/windows-DRIVER-SETUP.txt`.
+- Изменения упаковки проверяйте локально: `TARGET=... ARCHIVE=...
+  TAG=vX.Y.Z bash .github/scripts/package.sh` после сборки.

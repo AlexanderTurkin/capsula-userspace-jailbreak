@@ -172,9 +172,11 @@ adb shell
 - ADB по Wi-Fi: см. раздел «Подключение: USB и Wi-Fi»;
 - Linux без root: `sudo cp resources/udev/99-capsula-jailbreak.rules
   /etc/udev/rules.d/ && sudo udevadm control --reload`.
-- `AGENTS.md` — полная инструкция для LLM-агентов: правила
-  подтверждения записи (`--yes`) и тумблер USB-драйверов на Windows
-  (Zadig ↔ Rockusb) с проверкой привязки из командной строки.
+- Инструкция для LLM-агентов по прошивке — правила подтверждения
+  записи (`--yes`), тумблер USB-драйверов WinUSB ↔ Rockusb с проверкой
+  привязки из командной строки: `AGENTS.md` в релизном архиве
+  (`resources/packaging/AGENTS.md` в репозитории). Корневой
+  `AGENTS.md` — инструкция по разработке.
 
 ## Устройство репозитория
 
