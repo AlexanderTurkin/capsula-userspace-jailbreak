@@ -1,0 +1,10 @@
+/target
+/.idea
+/dist
+/staging
+
+# tool data
+/ota
+/backup
+/work
+.DS_Store

@@ -1,0 +1,29 @@
+capsula-jb — quick start
+========================
+
+1. Windows only: run DRIVER-SETUP.txt first (one-time USB driver install).
+   macOS note: if the binary is blocked after downloading, run
+   `xattr -d com.apple.quarantine capsula-jb` (or see README).
+   Linux note: for access without root, see the udev rules in README.
+
+2. Put the speaker into rockchip loader mode:
+   power off, peel off the bottom pad, connect micro-USB (OTG) to the
+   computer, hold the Recovery button (the lower of the two holes above
+   the micro-USB port) with a needle while powering on, release after a
+   few seconds. The board shows up as USB 2207:330d.
+
+3. Run:
+   capsula-jb            (full scenario: dump -> adbd overlay -> reboot)
+
+   Useful variants:
+   capsula-jb backup     dump all partitions only, nothing is written
+   capsula-jb --help     all options
+
+4. When the tool reports "ADB is up", connect over USB:
+   adb devices && adb shell       (root shell, no authorization)
+
+   The speaker also listens for ADB over the network once it is
+   connected to Wi-Fi (with the speaker on and configured):
+   adb connect <speaker-ip>:5555 && adb shell
+
+See README.md for details, safety notes and troubleshooting.

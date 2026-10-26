@@ -1,0 +1,20 @@
+[package]
+name = "jb-cli"
+description = "capsula-jb — the VK Capsula userspace-jailbreak CLI: backup/userdata-overlay/monitor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "capsula-jb"
+path = "src/main.rs"
+
+[dependencies]
+jb-core = { workspace = true }
+rockusb = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+clap = { workspace = true }
+indicatif = { workspace = true }

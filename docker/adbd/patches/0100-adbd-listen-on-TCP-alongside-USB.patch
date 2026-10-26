@@ -1,0 +1,53 @@
+From: Capsula-OS
+Subject: [PATCH] adbd: listen on TCP alongside USB
+
+Debian's adbd either/or startup: when the USB gadget is configured
+(which our init script always does, so that plugging the cable in
+later works), the TCP listener is never started and `adb connect`
+cannot work at all.  Run the TCP listener in addition to USB
+instead: the port comes from $ADBD_TCP_PORT (default 5555, 0 = off),
+since there is no property service on a vanilla Linux system.
+
+The upstream behaviour with no USB gadget present (fall back to
+DEFAULT_ADB_LOCAL_TRANSPORT_PORT) is preserved as the default.
+--- a/core/adbd/adb.c
++++ b/core/adbd/adb.c
+@@ -1305,29 +1305,20 @@
+         }
+     }
+ 
+-    int usb = 0;
+     if (access(USB_ADB_PATH, F_OK) == 0 || access(USB_FFS_ADB_EP0, F_OK) == 0) {
+         // listen on USB
+         usb_init();
+-        usb = 1;
+     }
+ 
+-    // If one of these properties is set, also listen on that port
+-    // If one of the properties isn't set and we couldn't listen on usb,
+-    // listen on the default port.
+-    //property_get("service.adb.tcp.port", value, "");
+-    //if (!value[0]) {
+-        //property_get("persist.adb.tcp.port", value, "");
+-    //}
+-    //if (sscanf(value, "%d", &port) == 1 && port > 0) {
+-    //    printf("using port=%d\n", port);
+-        // listen on TCP port specified by service.adb.tcp.port property
+-    //    local_init(port);
+-    //} else 
+-    if (!usb) {
+-        printf("Using USB\n");
+-        // listen on default port
+-        local_init(DEFAULT_ADB_LOCAL_TRANSPORT_PORT);
++    /* Capsula-OS: listen on TCP in addition to USB, not instead of it.
++     * There is no property service on a vanilla Linux system, so the
++     * port comes from $ADBD_TCP_PORT (default 5555; 0 disables). */
++    port = DEFAULT_ADB_LOCAL_TRANSPORT_PORT;
++    if (getenv("ADBD_TCP_PORT") != NULL)
++        port = atoi(getenv("ADBD_TCP_PORT"));
++    if (port > 0) {
++        printf("adbd: listening on tcp:%d\n", port);
++        local_init(port);
+     }
+ 
+     D("adb_main(): pre init_jdwp()\n");

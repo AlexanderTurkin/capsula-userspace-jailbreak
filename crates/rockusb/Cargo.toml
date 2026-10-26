@@ -1,0 +1,16 @@
+[package]
+name = "rockusb"
+description = "Native Rockchip protocols: MaskROM DownloadBoot and rockusb (an xrock port) over nusb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nusb = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+env_logger = { workspace = true }

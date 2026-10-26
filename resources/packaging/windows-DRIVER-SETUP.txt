@@ -1,0 +1,24 @@
+One-time USB driver setup for Windows
+======================================
+
+capsula-jb talks to the speaker over USB and on Windows this requires a
+WinUSB-class driver for the Rockchip vendor ID (2207). The bundled
+RockchipUSBDriver.zip contains the official Rockchip DriverAssistant
+that installs it for all Rockchip device modes.
+
+Steps:
+
+1. Unpack RockchipUSBDriver.zip to any folder.
+2. Run DriverInstall.exe from the unpacked DriverAssitant_v5.14 folder
+   (right-click -> Run as administrator is not required, but helps on
+   locked-down machines).
+3. Wait for "Install OK" / success, then close the tool.
+4. Verify: put the speaker into rockchip loader mode (see QUICKSTART.txt)
+   and run `capsula-jb monitor` — the device appears as 2207:330d.
+
+Notes:
+
+- The driver is a one-time install; capsula-jb updates do not repeat it.
+- DriverAssistant only installs USB drivers; it does not touch disks,
+  firmware or anything else.
+- No internet connection is required for the install.

@@ -1,0 +1,139 @@
+# Release: build for every supported platform, package and publish a
+# GitHub release with the archives.
+#
+# Tag a version (v0.1.0) and push the tag — the release appears with:
+#   capsula-jb-<tag>-x86_64-linux.tar.gz
+#   capsula-jb-<tag>-aarch64-linux.tar.gz
+#   capsula-jb-<tag>-x86_64-macos.zip   (cross-compiled on an arm64 runner)
+#   capsula-jb-<tag>-aarch64-macos.zip
+#   capsula-jb-<tag>-x86_64-windows.zip   (+ bundled Rockchip USB driver installer)
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Rockchip DriverAssistant (WinUSB drivers for VID 2207 on Windows).
+  # Pinned by SHA256: an upstream change fails the build instead of
+  # shipping an unreviewed binary.
+  DRIVER_URL: https://dl.radxa.com/tools/windows/DriverAssitant.zip
+  DRIVER_SHA256: ffc71ccf8aa40afe74b485393dc5572e431b6ecc84b13eee5360907c7ec84276
+
+jobs:
+  adbd:
+    # The overlay adbd, built from source in a hermetic bullseye
+    # container (glibc 2.31 / libcrypto 1.1 — the stock firmware ABI).
+    name: adbd (docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build adbd in Docker
+        run: |
+          docker build -t capsula-adbd docker/adbd
+          docker run --rm -v "$PWD/docker/adbd":/work capsula-adbd /work/build.sh
+      - name: Sanity-check the binary
+        run: |
+          file docker/adbd/out/adbd | grep -q "ARM aarch64"
+          grep -aq ADBD_TCP_PORT docker/adbd/out/adbd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: adbd
+          path: docker/adbd/out/adbd
+          retention-days: 1
+          if-no-files-found: error
+
+  build:
+    needs: adbd
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          # cross-compiled on an amd64 runner (arm64 runners are only
+          # free for public repositories)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: zip
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Fetch the freshly built adbd
+        uses: actions/download-artifact@v4
+        with:
+          name: adbd
+          path: adbd-artifact
+      - name: Place adbd into the overlay
+        shell: bash
+        run: |
+          cp adbd-artifact/adbd resources/overlay/usr/bin/adbd
+          chmod +x resources/overlay/usr/bin/adbd
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }}
+      - name: Install the aarch64 cross toolchain (linux-arm64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          {
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
+            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+            echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
+          } >> "$GITHUB_ENV"
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCHIVE: ${{ matrix.archive }}
+          TAG: ${{ github.ref_name }}
+        run: bash .github/scripts/package.sh
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: capsula-jb-${{ github.ref_name }}-${{ matrix.target }}
+          path: dist/*
+          retention-days: 5
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "capsula-jb $TAG" \
+            --generate-notes \
+            dist/*
