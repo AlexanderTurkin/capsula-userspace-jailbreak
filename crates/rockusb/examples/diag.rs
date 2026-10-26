@@ -2,14 +2,14 @@
 //! ready/chip_info/flash_detect and a reset, with full error output.
 
 use rockusb::loader::{opcode, LoaderSession};
-use rockusb::{DeviceMode, NusbTransport};
+use rockusb::DeviceMode;
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
     let mode = rockusb::current_mode().expect("bus");
     println!("bus mode: {mode:?}");
 
-    let t = NusbTransport::open(&DeviceMode::Loader).expect("open 330d");
+    let t = rockusb::open_mode(&DeviceMode::Loader).expect("open 330d");
     let (ep_in, ep_out) = (t.ep_in, t.ep_out);
     let mut s = LoaderSession::new(t, ep_in, ep_out);
 

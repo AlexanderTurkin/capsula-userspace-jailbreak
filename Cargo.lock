@@ -18,6 +18,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "amlogic"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "hex",
+ "log",
+ "thiserror 2.0.21",
+ "usbcore",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -938,6 +949,7 @@ dependencies = [
  "log",
  "nusb",
  "thiserror 2.0.21",
+ "usbcore",
 ]
 
 [[package]]
@@ -1332,6 +1344,16 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+]
+
+[[package]]
+name = "usbcore"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "log",
+ "nusb",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

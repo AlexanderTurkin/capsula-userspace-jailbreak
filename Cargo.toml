@@ -1,7 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/usbcore",
     "crates/rockusb",
+    "crates/amlogic",
     "crates/jb-core",
     "crates/jb-cli",
 ]
@@ -14,7 +16,9 @@ repository = "https://github.com/LibreCapsula/capsula-userspace-jailbreak"
 
 [workspace.dependencies]
 # internal
+usbcore = { path = "crates/usbcore" }
 rockusb = { path = "crates/rockusb" }
+amlogic = { path = "crates/amlogic" }
 jb-core = { path = "crates/jb-core" }
 
 # usb / protocol

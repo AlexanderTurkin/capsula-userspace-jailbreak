@@ -1,0 +1,30 @@
+//! USB transport error types (shared by the vendor protocol crates).
+
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum Error {
+    /// Device not found / has disappeared.
+    #[error("usb device not found")]
+    DeviceNotFound,
+    /// USB transport error.
+    #[error("usb: {0}")]
+    Usb(String),
+    /// I/O error.
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl From<nusb::Error> for Error {
+    fn from(e: nusb::Error) -> Self {
+        Error::Usb(e.to_string())
+    }
+}
+
+impl From<nusb::transfer::TransferError> for Error {
+    fn from(e: nusb::transfer::TransferError) -> Self {
+        Error::Usb(e.to_string())
+    }
+}
+
+pub type Result<T> = std::result::Result<T, Error>;

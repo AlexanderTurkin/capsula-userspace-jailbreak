@@ -11,7 +11,7 @@
 //! length = sectors*512. Reproduced literally from rock.c.
 
 use crate::error::{Error, Result};
-use crate::transport::Transport;
+use usbcore::Transport;
 
 pub mod opcode {
     pub const TEST_UNIT_READY: u8 = 0x00;

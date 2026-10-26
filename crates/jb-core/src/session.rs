@@ -8,9 +8,7 @@
 use crate::config::Config;
 use rockusb::loader::RESET_SUBCODE_MASKROM;
 use rockusb::monitor::wait_download_mode;
-use rockusb::{
-    Error as UsbError, LoaderContainer, LoaderSession, MaskRomSession, NusbTransport, Transport,
-};
+use rockusb::{Error as UsbError, LoaderContainer, LoaderSession, MaskRomSession, Transport};
 use std::time::Duration;
 
 /// Progress events for CLI/GUI.
@@ -56,7 +54,7 @@ pub fn bring_up(
     loader: &LoaderContainer,
     wait: Option<Duration>,
     progress: ProgressFn,
-) -> Result<LoaderSession<NusbTransport>, BringUpError> {
+) -> Result<LoaderSession<rockusb::NusbTransport>, BringUpError> {
     let hint = &config.hint.text;
     loop {
         let mode = rockusb::current_mode()?;
@@ -147,15 +145,15 @@ pub fn bring_up(
     }
 }
 
-fn open_loader() -> rockusb::Result<LoaderSession<NusbTransport>> {
-    let t = NusbTransport::open(&rockusb::DeviceMode::Loader)
-        .or_else(|_| NusbTransport::open(&rockusb::DeviceMode::UsbPlug))?;
+fn open_loader() -> rockusb::Result<LoaderSession<rockusb::NusbTransport>> {
+    let t = rockusb::open_mode(&rockusb::DeviceMode::Loader)
+        .or_else(|_| rockusb::open_mode(&rockusb::DeviceMode::UsbPlug))?;
     let (ep_in, ep_out) = (t.ep_in, t.ep_out);
     Ok(LoaderSession::new(t, ep_in, ep_out))
 }
 
-fn open_maskrom() -> rockusb::Result<NusbTransport> {
-    NusbTransport::open(&rockusb::DeviceMode::MaskRom)
+fn open_maskrom() -> rockusb::Result<rockusb::NusbTransport> {
+    rockusb::open_mode(&rockusb::DeviceMode::MaskRom)
 }
 
 /// Verify the usbplug signatures in DRAM: proof that our loader build is

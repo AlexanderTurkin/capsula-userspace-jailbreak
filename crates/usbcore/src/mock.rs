@@ -9,6 +9,9 @@ use crate::transport::Transport;
 pub enum Step {
     /// Expect control_out(request, value, index) with this data (checked).
     ControlOut(u8, u16, u16, Vec<u8>),
+    /// Expect control_in(request, value, index) answering with this data
+    /// (request/value/index checked; the data must fit the caller buffer).
+    ControlIn(u8, u16, u16, Vec<u8>),
     /// Expect a bulk write to any endpoint with this content.
     BulkOut(Vec<u8>),
     /// Answer a bulk read with these bytes (exhaustion is an error).
@@ -62,13 +65,36 @@ impl Transport for MockTransport {
         }
     }
 
+    fn control_in(&mut self, request: u8, value: u16, index: u16, buf: &mut [u8]) -> Result<usize> {
+        match self.next("control_in")? {
+            Step::ControlIn(r, v, i, answer) => {
+                if r != request || v != value || i != index {
+                    return Err(Error::Usb(format!(
+                        "mock: control_in mismatch (want {r:#x}/{v:#x}/{i:#x})"
+                    )));
+                }
+                if answer.len() > buf.len() {
+                    return Err(Error::Usb("mock: control_in would overflow".into()));
+                }
+                buf[..answer.len()].copy_from_slice(&answer);
+                self.log
+                    .push(format!("ctrl-in {r:#x} {}b", answer.len()));
+                Ok(answer.len())
+            }
+            other => Err(Error::Usb(format!(
+                "mock: expected {other:?}, got control_in"
+            ))),
+        }
+    }
+
     fn bulk_write(&mut self, endpoint: u8, data: &[u8]) -> Result<()> {
         match self.next("bulk_write")? {
             Step::BulkOut(expect) => {
                 if expect != data {
                     return Err(Error::Usb(format!(
-                        "mock: bulk_write mismatch\n  expected: {}",
+                        "mock: bulk_write mismatch\n  expected: {}\n  got:      {}",
                         hex::encode(expect),
+                        hex::encode(data),
                     )));
                 }
                 self.log

@@ -1,0 +1,13 @@
+[package]
+name = "usbcore"
+description = "Cross-platform USB transport over nusb (WinUSB on Windows): vendor control and bulk transfers + mock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nusb = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+hex = { workspace = true }

@@ -3,7 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::loader_container::LoaderContainer;
-use crate::transport::Transport;
+use usbcore::Transport;
 use crate::util::{crc16_xrock, Rc4};
 
 const CHUNK: usize = 4096;

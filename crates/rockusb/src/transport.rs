@@ -1,11 +1,11 @@
-//! USB transport: a trait over nusb (mockable for tests) and Rockchip
-//! device-mode enumeration.
+//! Rockchip device-mode enumeration on the bus. The transport itself
+//! ([`usbcore::Transport`] / [`usbcore::NusbTransport`]) lives in the
+//! shared usbcore crate; this module adds the Rockchip-specific mode
+//! detection (loader vs MaskROM vs the live Linux gadget).
 
-use crate::error::{Error, Result};
-use nusb::descriptors::TransferType;
-use nusb::transfer::{ControlOut, ControlType, Direction, Recipient};
+use crate::error::Result;
 use nusb::MaybeFuture;
-use std::io::{Read as _, Write as _};
+use usbcore::NusbTransport;
 
 /// Snapshot of a Rockchip device present on the bus.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -63,142 +63,15 @@ impl DeviceMode {
     }
 }
 
-/// Minimal synchronous transport needed by the Rockchip protocols.
-/// Production: NusbTransport; tests: mock.
-pub trait Transport {
-    /// Vendor OUT control transfer on endpoint 0 (MaskROM DownloadBoot:
-    /// request=0x0C, value=0, index=stage code 0x471/0x472).
-    fn control_out(&mut self, request: u8, value: u16, index: u16, data: &[u8]) -> Result<()>;
-
-    /// Write the whole buffer to a bulk-OUT endpoint (split into chunks).
-    fn bulk_write(&mut self, endpoint: u8, data: &[u8]) -> Result<()>;
-
-    /// Read exactly buf.len() bytes from a bulk-IN endpoint (loop until
-    /// full).
-    fn bulk_read(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<()>;
-}
-
-/// Timeout for control transfers.
-const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Transport over nusb (blocking IO via the MaybeFuture/EndpointRead/
-/// EndpointWrite adapters).
-pub struct NusbTransport {
-    #[allow(dead_code)] // kept for the interface lifetime
-    device: nusb::Device,
-    interface: nusb::Interface,
-    /// bulk-IN endpoint (usually 0x81).
-    pub ep_in: u8,
-    /// bulk-OUT endpoint (usually 0x02).
-    pub ep_out: u8,
-}
-
-impl NusbTransport {
-    /// Open the Rockchip device in the given mode and claim interface 0.
-    /// Errors if the device is not present.
-    pub fn open(mode: &DeviceMode) -> Result<Self> {
-        let info = nusb::list_devices()
-            .wait()?
-            .filter(|d| d.vendor_id() == crate::USB_VID_ROCKCHIP && d.product_id() == mode.pid())
-            .find(|d| match mode {
-                // usbplug and MaskROM share the PID — told apart by iProduct
-                DeviceMode::UsbPlug => d.product_string() == Some("USB-MSC"),
-                DeviceMode::MaskRom => d.product_string() != Some("USB-MSC"),
-                _ => true,
-            })
-            .ok_or(Error::DeviceNotFound)?;
-
-        Self::open_device_info(&info)
-    }
-
-    /// Open an exact DeviceInfo (to pick a specific instance).
-    pub fn open_device_info(info: &nusb::DeviceInfo) -> Result<Self> {
-        let device = info.open().wait()?;
-        let interface = match device.claim_interface(0).wait() {
-            Ok(i) => i,
-            Err(_) => device.detach_and_claim_interface(0).wait()?,
-        };
-
-        // Find the bulk IN/OUT endpoints in the active configuration
-        let config = device
-            .active_configuration()
-            .map_err(|e| Error::Usb(e.to_string()))?;
-        let mut ep_in = None;
-        let mut ep_out = None;
-        'outer: for iface in config.interfaces() {
-            for alt in iface.alt_settings() {
-                for ep in alt.endpoints() {
-                    if ep.transfer_type() != TransferType::Bulk {
-                        continue;
-                    }
-                    match ep.direction() {
-                        Direction::In => ep_in = Some(ep.address()),
-                        Direction::Out => ep_out = Some(ep.address()),
-                    }
-                }
-                if ep_in.is_some() && ep_out.is_some() {
-                    break 'outer;
-                }
-            }
-        }
-        let (ep_in, ep_out) = (ep_in, ep_out);
-        let (Some(ep_in), Some(ep_out)) = (ep_in, ep_out) else {
-            return Err(Error::Usb("device has no bulk endpoints".into()));
-        };
-
-        Ok(NusbTransport {
-            device,
-            interface,
-            ep_in,
-            ep_out,
-        })
-    }
-}
-
-impl Transport for NusbTransport {
-    fn control_out(&mut self, request: u8, value: u16, index: u16, data: &[u8]) -> Result<()> {
-        self.interface
-            .control_out(
-                ControlOut {
-                    control_type: ControlType::Vendor,
-                    recipient: Recipient::Device,
-                    request,
-                    value,
-                    index,
-                    data,
-                },
-                CONTROL_TIMEOUT,
-            )
-            .wait()?;
-        Ok(())
-    }
-
-    fn bulk_write(&mut self, endpoint: u8, data: &[u8]) -> Result<()> {
-        let ep = self
-            .interface
-            .endpoint::<nusb::transfer::Bulk, nusb::transfer::Out>(endpoint)
-            .map_err(|e| Error::Usb(e.to_string()))?;
-        let mut writer = ep.writer(data.len().max(512));
-        writer
-            .write_all(data)
-            .map_err(|e| Error::Usb(e.to_string()))?;
-        // EndpointWrite buffers until full: without an explicit flush a
-        // short write (the 31-byte CBW) is never submitted.
-        writer.flush().map_err(|e| Error::Usb(e.to_string()))?;
-        Ok(())
-    }
-
-    fn bulk_read(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<()> {
-        let ep = self
-            .interface
-            .endpoint::<nusb::transfer::Bulk, nusb::transfer::In>(endpoint)
-            .map_err(|e| Error::Usb(e.to_string()))?;
-        let mut reader = ep.reader(buf.len().max(512));
-        reader
-            .read_exact(buf)
-            .map_err(|e| Error::Usb(e.to_string()))?;
-        Ok(())
-    }
+/// Open the Rockchip device in the given mode (claim interface 0).
+/// Errors if the device is not present.
+pub fn open_mode(mode: &DeviceMode) -> Result<NusbTransport> {
+    Ok(NusbTransport::open_first(crate::USB_VID_ROCKCHIP, mode.pid(), |d| match mode {
+        // usbplug and MaskROM share the PID — told apart by iProduct
+        DeviceMode::UsbPlug => d.product_string() == Some("USB-MSC"),
+        DeviceMode::MaskRom => d.product_string() != Some("USB-MSC"),
+        _ => true,
+    })?)
 }
 
 /// All Rockchip modes currently on the bus (deduplicated).

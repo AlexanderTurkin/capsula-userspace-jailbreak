@@ -39,4 +39,13 @@ impl From<nusb::transfer::TransferError> for Error {
     }
 }
 
+impl From<usbcore::Error> for Error {
+    fn from(e: usbcore::Error) -> Self {
+        match e {
+            usbcore::Error::DeviceNotFound => Error::DeviceNotFound,
+            other => Error::Usb(other.to_string()),
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
