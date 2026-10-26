@@ -72,11 +72,8 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
-    match cli.command {
-        Some(Command::WinDrvHelper { done }) => {
-            std::process::exit(win_drv::helper_main(&done));
-        }
-        _ => {}
+    if let Some(Command::WinDrvHelper { done }) = &cli.command {
+        std::process::exit(win_drv::helper_main(done));
     }
     let wait = if cli.wait == 0 {
         None

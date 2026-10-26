@@ -140,10 +140,8 @@ fn reg_string(set: isize, dev: &SP_DEVINFO_DATA, prop: u32, multi: bool) -> Stri
         {
             return String::new();
         }
-        let units: Vec<u16> = buf[..buf.len() / 2]
-            .chunks_exact(2)
-            .map(|c| u16::from_ne_bytes([c[0], c[1]]))
-            .collect();
+        let (words, _) = buf.as_chunks::<2>();
+        let units: Vec<u16> = words.iter().map(|c| u16::from_ne_bytes(*c)).collect();
         let s = narrow(&units);
         if multi {
             // first line of the multi-sz is the specific hardware ID
