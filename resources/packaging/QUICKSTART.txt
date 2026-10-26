@@ -26,4 +26,9 @@ capsula-jb — quick start
    connected to Wi-Fi (with the speaker on and configured):
    adb connect <speaker-ip>:5555 && adb shell
 
+Scripted / agent use: the tool prints "proceed? [y/N]" and waits for
+input before writing userdata. With a non-interactive stdin (CI, LLM
+agents) it exits with an error instead, writing nothing — re-run with
+--yes once the write has been approved. `backup` never asks anything.
+
 See README.md for details, safety notes and troubleshooting.

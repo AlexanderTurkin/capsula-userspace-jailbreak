@@ -190,7 +190,18 @@ fn run_jailbreak(wait: Option<Duration>, yes: bool, format_userdata: bool) -> an
 }
 
 fn ask_yes() -> anyhow::Result<()> {
-    use std::io::Write;
+    use std::io::{IsTerminal, Write};
+    // Non-interactive stdin (CI, LLM agent shells, redirected input):
+    // never hang on a prompt nobody can answer — fail with an
+    // actionable message instead. Nothing has been written at this
+    // point, so an exit is safe.
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "confirmation required before writing userdata, but stdin is not \
+             an interactive console; nothing was written. Re-run with --yes \
+             once the write has been approved."
+        );
+    }
     std::io::stdout().flush().ok();
     let mut ans = String::new();
     std::io::stdin().read_line(&mut ans)?;
