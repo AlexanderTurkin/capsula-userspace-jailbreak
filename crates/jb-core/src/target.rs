@@ -118,8 +118,16 @@ pub fn bring_up_amlogic(
 ) -> Result<(AmlogicSession<rockusb::NusbTransport>, amlogic::SocId), TargetError> {
     let start = Instant::now();
     let mut open_failures = 0u32;
+    let mut seen = false;
     loop {
-        if amlogic::present()? {
+        let on_bus = amlogic::present()?;
+        if on_bus != seen {
+            // every window opening/closing is logged: the wait must be
+            // diagnosable (the window is ~0.5 s per power-up)
+            log::info!("usb: 1b8e:c003 {}", if on_bus { "appeared" } else { "gone" });
+            seen = on_bus;
+        }
+        if on_bus {
             match open_and_identify(progress) {
                 Ok(pair) => return Ok(pair),
                 Err(amlogic::Error::DeviceNotFound) => {} // window race
