@@ -18,8 +18,12 @@ Switch the board to WinUSB (to run capsula-jb)
 1. Put the speaker into rockchip loader mode (see QUICKSTART.txt).
 2. Run zadig-2.9.exe from this folder.
 3. Options -> enable "List All Devices".
-4. Select the device with USB ID 2207:330D (shown as "Rockusb
-   Device"), pick WinUSB with the arrows, click "Replace Driver".
+4. Select the device with USB ID 2207:330D. Zadig lists devices by
+   their USB product string — in loader mode it is typically "USB
+   download gadget" (Device Manager, in contrast, shows the
+   driver-provided name "Rockusb Device"); go by the USB ID, not by
+   the display name. Pick WinUSB with the arrows, click "Replace
+   Driver".
 5. Verify the binding:
 
    powershell -NoProfile -Command "Get-PnpDevice | Where-Object { $_.InstanceId -match 'VID_2207&PID_330D' } | Get-PnpDeviceProperty -KeyName DEVPKEY_Device_Service | Format-List KeyName,Data"
