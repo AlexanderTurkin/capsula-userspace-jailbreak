@@ -1,7 +1,9 @@
 capsula-jb — quick start
 ========================
 
-1. Windows only: run DRIVER-SETUP.txt first (one-time USB driver install).
+1. Windows only: do the USB driver setup in DRIVER-SETUP.txt first
+   (toggle the board to WinUSB with the bundled zadig-2.9.exe; you can
+   switch back to the vendor driver for RKDevTool at any time).
    macOS note: if the binary is blocked after downloading, run
    `xattr -d com.apple.quarantine capsula-jb` (or see README).
    Linux note: for access without root, see the udev rules in README.
@@ -30,5 +32,6 @@ Scripted / agent use: the tool prints "proceed? [y/N]" and waits for
 input before writing userdata. With a non-interactive stdin (CI, LLM
 agents) it exits with an error instead, writing nothing — re-run with
 --yes once the write has been approved. `backup` never asks anything.
+Full agent instructions (driver toggle, safety rules): AGENTS.md.
 
 See README.md for details, safety notes and troubleshooting.

@@ -20,12 +20,15 @@ Windows, macOS): Rockchip USB-протоколы, форматы OTA и ext2/3/4
 
 Готовые сборки — в [Releases](../../releases): архивы под Windows
 (x64), Linux (x64/arm64) и macOS (x64/arm64). В каждом архиве —
-бинарник, README и QUICKSTART.txt; в Windows-архив дополнительно вложен
-официальный установщик USB-драйверов Rockchip.
+бинарник, README, QUICKSTART.txt и AGENTS.md; в Windows-архив
+дополнительно вложены Zadig и официальный установщик USB-драйверов
+Rockchip.
 
-- **Windows**: распакуйте архив, один раз выполните
-  `DRIVER-SETUP.txt` (установка WinUSB-драйвера для VID 2207 —
-  DriverAssistant из вложенного `RockchipUSBDriver.zip`), затем
+- **Windows**: распакуйте архив и настройте USB-драйвер по
+  `DRIVER-SETUP.txt`: capsula-jb открывает плату через WinUSB —
+  переключите её вложенным `zadig-2.9.exe`; вендорский драйвер Rockusb
+  (он нужен RKDevTool/upgrade_tool) ставится из
+  `RockchipUSBDriver.zip` и возвращается теми же шагами. Затем
   запускайте `capsula-jb.exe`.
 - **macOS**: если бинарник заблокирован Gatekeeper после скачивания
   браузером — `xattr -d com.apple.quarantine capsula-jb`.
@@ -169,6 +172,9 @@ adb shell
 - ADB по Wi-Fi: см. раздел «Подключение: USB и Wi-Fi»;
 - Linux без root: `sudo cp resources/udev/99-capsula-jailbreak.rules
   /etc/udev/rules.d/ && sudo udevadm control --reload`.
+- `AGENTS.md` — полная инструкция для LLM-агентов: правила
+  подтверждения записи (`--yes`) и тумблер USB-драйверов на Windows
+  (Zadig ↔ Rockusb) с проверкой привязки из командной строки.
 
 ## Устройство репозитория
 
@@ -198,9 +204,9 @@ resources/
 
 ## Лицензия
 
-MIT — см. [LICENSE](LICENSE). В релизные архивы вкладывается
-установщик USB-драйверов Rockchip DriverAssistant (распространяется
-как есть, по собственной лицензии вендора).
+MIT — см. [LICENSE](LICENSE). В релизные архивы вкладываются
+установщик USB-драйверов Rockchip DriverAssistant (по собственной
+лицензии вендора) и Zadig 2.9 (GPLv3, Akeo Consulting) — оба как есть.
 
 ## Разработка
 
