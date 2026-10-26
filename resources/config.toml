@@ -25,7 +25,8 @@ signature2_hex = "29c54eb91f01096bc2000054"
 # mode differently).
 [hint]
 text = """
-How to put the speaker into rockchip loader mode:
+Connect the speaker to the computer with a USB cable and power it, so
+the tool can pick it up. Supported boards and their download modes:
 
   Big Capsula: power the unit off, peel off the bottom pad, connect
   micro-USB (OTG) to the computer. Take a needle: the two holes above
@@ -33,10 +34,24 @@ How to put the speaker into rockchip loader mode:
   (farther from the power jack) and, holding it, power the unit on.
   Release after a few seconds — the board shows up as 2207:330d.
 
-  Mini: there is no Recovery button. Hold the touch button while
-  powering on, or press Ctrl+D in the debug UART console with OTG
+  Mini on Rockchip: there is no Recovery button. Hold the touch button
+  while powering on, or press Ctrl+D in the debug UART console with OTG
   connected (rockusb, 2207:330d), or Ctrl+B (MaskROM, 2207:330e).
+
+  Mini on Amlogic (1b8e:c003): nothing to press — the stock u-boot
+  raises its factory download window on every power-up for about half a
+  second; the tool catches it automatically. If it was missed (the tool
+  kept waiting), power the speaker off and on again while it stays
+  connected.
 
   A short-lived 2207:0006 at startup is the stock Linux gadget (44.90+
   firmware ships without adbd, the gadget dies within a second): it is
-  NOT a download mode. The tool waits for 330d/330e and only logs 0006."""
+  NOT a download mode. The tool waits for 330d/330e/1b8e:c003 and only
+  logs 0006."""
+
+# Extra note shown for the Amlogic boards right after the main hint.
+amlogic_text = """
+The late Capsula Mini revisions are on an Amlogic A113X (MRC02B board,
+1b8e:c003). Their flashing scenario is in development; for now the tool
+identifies the board and can pass u-boot burning commands through
+(`capsula-jb aml "printenv bootdelay"`)."""

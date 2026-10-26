@@ -1,5 +1,8 @@
-# capsula-jb: rootless access to the Rockchip USB modes.
+# capsula-jb: rootless access to the speaker download modes (both vendors).
 # Install: sudo cp 99-capsula-jailbreak.rules /etc/udev/rules.d/ && sudo udevadm control --reload
+# Rockchip (Capsule-14/15, early minis)
 SUBSYSTEM=="usb", ATTR{idVendor}=="2207", ATTR{idProduct}=="330d", TAG+="uaccess", MODE="0660"
 SUBSYSTEM=="usb", ATTR{idVendor}=="2207", ATTR{idProduct}=="330e", TAG+="uaccess", MODE="0660"
 SUBSYSTEM=="usb", ATTR{idVendor}=="2207", ATTR{idProduct}=="0006", TAG+="uaccess", MODE="0660"
+# Amlogic (late Capsula Mini revisions, MRC02B board)
+SUBSYSTEM=="usb", ATTR{idVendor}=="1b8e", ATTR{idProduct}=="c003", TAG+="uaccess", MODE="0660"

@@ -1,13 +1,18 @@
-//! capsula-jb — jailbreak CLI for VK Capsula speakers (Rockchip RK3308).
+//! capsula-jb — jailbreak CLI for VK Capsula speakers.
 //!
-//! Method: userspace overwrite. The userdata partition is not signed and
-//! can be rewritten by the user freely; no other partition is modified.
+//! Method: userspace overwrite (Rockchip boards). The userdata partition
+//! is not signed and can be rewritten by the user freely; no other
+//! partition is modified.
 //!
 //! Default scenario (no subcommand):
+//!   0. wait for a supported speaker to be plugged in and powered, then
+//!      dispatch on the SoC vendor:
+//!      - Rockchip (2207:330d/330e): the full scenario below;
+//!      - Amlogic (1b8e:c003, the late minis): identify the board (the
+//!        flashing scenario for it is in development).
 //!   1. fetch the Capsule-14 OTA, extract the loader into ota/ (cached;
-//!      one loader for all supported boards)
-//!   2. wait for the device in rockchip loader mode, start our usbplug
-//!      in RAM
+//!      one loader for all supported Rockchip boards)
+//!   2. start our usbplug in RAM
 //!   3. patch the read limit over USB (0xCC bypass), dump all partitions
 //!      into backup/
 //!   4. build the adbd overlay on top of the userdata dump
@@ -21,6 +26,7 @@ use clap::{Parser, Subcommand};
 use jb_core::backup_store::BackupStore;
 use jb_core::config::Config;
 use jb_core::session::{bring_up, BringUpError, Progress};
+use jb_core::target::{self, Target};
 use jb_core::{backup, flash, ota, userdata};
 use rockusb::loader::RESET_SUBCODE_NORMAL;
 use rockusb::{LoaderContainer, NusbTransport};
@@ -35,7 +41,7 @@ const GADGET_STABLE: Duration = Duration::from_secs(10);
 #[command(
     name = "capsula-jb",
     version,
-    about = "VK Capsula (Rockchip RK3308) userspace jailbreak: dump -> adbd overlay in userdata -> ADB"
+    about = "VK Capsula userspace jailbreak: dump -> adbd overlay in userdata -> ADB (Rockchip); board identification and u-boot command passthrough (Amlogic minis)"
 )]
 struct Cli {
     /// Timeout for waiting for the device on USB, seconds (0 = forever)
@@ -59,8 +65,14 @@ struct Cli {
 enum Command {
     /// Dump all partitions into backup/ only (nothing is written to the device)
     Backup,
-    /// Live log of 2207:* USB events
+    /// Live log of the download-mode USB events (2207:* and 1b8e:c003)
     Monitor,
+    /// Amlogic mini: identify the board / run a u-boot burning command
+    Aml {
+        /// u-boot burning command to execute, e.g. "printenv bootdelay";
+        /// omit to identify the board only
+        cmd: Option<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -75,6 +87,7 @@ fn main() -> anyhow::Result<()> {
         None => run_jailbreak(wait, cli.yes, cli.format_userdata),
         Some(Command::Backup) => run_backup(wait),
         Some(Command::Monitor) => monitor(),
+        Some(Command::Aml { cmd }) => run_amlogic(wait, cmd.as_deref()),
     }
 }
 
@@ -84,27 +97,24 @@ fn print_step(ev: Progress) {
     }
 }
 
-/// Prepare the loader: ota/loader.bin from cache or a fresh OTA download.
-fn ensure_loader(config: &Config) -> anyhow::Result<LoaderContainer> {
-    let (container, version) =
-        ota::ensure_loader(Path::new("ota"), &config.ota.platform, &|step| match step {
-            ota::Step::Cached(path) => println!("loader: using cached {path}"),
-            ota::Step::Fetching(code) => println!("querying latest firmware for {code}..."),
-            ota::Step::Unpacking(path) => println!("extracting loader from OTA package {path}"),
-            ota::Step::Saved { path, version } => {
-                println!("loader saved: {path} (OTA {version})")
-            }
-        })
-        .context("failed to prepare the loader from the OTA")?;
-    if let Some(v) = version {
-        println!("loader OTA version: {v}");
+/// Step 0: prompt to connect the speaker and wait for a supported
+/// download mode; the SoC vendor decides the scenario.
+fn detect_target(wait: Option<Duration>) -> anyhow::Result<Target> {
+    let config = Config::embedded();
+    let mut hint = config.hint.text.clone();
+    if !config.hint.amlogic_text.is_empty() {
+        hint.push('\n');
+        hint.push_str(&config.hint.amlogic_text);
     }
-    Ok(container)
+    target::wait_target(wait, &hint)
+        .context("failed while waiting for a supported speaker on the bus")
 }
 
-/// Steps 1-3: loader, device, full dump into backup/. Returns the live
-/// usbplug session (usable for the subsequent write).
-fn dump_all(wait: Option<Duration>) -> anyhow::Result<rockusb::LoaderSession<NusbTransport>> {
+/// Rockchip steps 1-3: loader, device bring-up, full dump into backup/.
+/// Returns the live usbplug session (usable for the subsequent write).
+fn rockchip_dump_all(
+    wait: Option<Duration>,
+) -> anyhow::Result<rockusb::LoaderSession<NusbTransport>> {
     let config = Config::embedded();
     let loader = ensure_loader(&config)?;
 
@@ -123,14 +133,34 @@ fn dump_all(wait: Option<Duration>) -> anyhow::Result<rockusb::LoaderSession<Nus
 
 /// `capsula-jb backup`: dump only.
 fn run_backup(wait: Option<Duration>) -> anyhow::Result<()> {
-    let _session = dump_all(wait)?;
-    println!("done: dumps are in backup/ (nothing was written to the device)");
+    match detect_target(wait)? {
+        Target::Rockchip(_) => {
+            let _session = rockchip_dump_all(wait)?;
+            println!("done: dumps are in backup/ (nothing was written to the device)");
+        }
+        Target::Amlogic => {
+            amlogic_scenario(wait)?;
+            bail!("partition backup for the Amlogic mini is not implemented yet");
+        }
+    }
     Ok(())
 }
 
-/// Full jailbreak scenario (steps 1-6).
+/// Full jailbreak scenario (steps 0-6).
 fn run_jailbreak(wait: Option<Duration>, yes: bool, format_userdata: bool) -> anyhow::Result<()> {
-    let mut s = dump_all(wait)?;
+    match detect_target(wait)? {
+        Target::Rockchip(_) => rockchip_jailbreak(wait, yes, format_userdata),
+        Target::Amlogic => amlogic_scenario(wait),
+    }
+}
+
+/// The Rockchip userspace-overwrite scenario (steps 1-6).
+fn rockchip_jailbreak(
+    wait: Option<Duration>,
+    yes: bool,
+    format_userdata: bool,
+) -> anyhow::Result<()> {
+    let mut s = rockchip_dump_all(wait)?;
 
     // step 4: overlay on top of the userdata dump
     let store = BackupStore::open(Path::new("backup")).context("no valid backup in backup/")?;
@@ -189,6 +219,80 @@ fn run_jailbreak(wait: Option<Duration>, yes: bool, format_userdata: bool) -> an
     Ok(())
 }
 
+/// The Amlogic path (late minis): bring-up + identify. The flashing
+/// scenario for these boards is in development; the u-boot burning
+/// command passthrough (`capsula-jb aml "<cmd>"`) is available.
+fn amlogic_scenario(wait: Option<Duration>) -> anyhow::Result<()> {
+    println!(
+        "Amlogic mini detected. Power it off and on while connected if the \
+         download window was missed."
+    );
+    let p = progress::CliProgress::new();
+    let progress = |ev: Progress| p.handle(ev);
+    let (_s, soc) = target::bring_up_amlogic(wait, &progress)?;
+    println!("board: Amlogic download mode, {soc}");
+    match soc.stage() {
+        amlogic::Stage::Tpl => {
+            println!("u-boot burning gadget is answering (the vendor factory window).");
+        }
+        amlogic::Stage::Ipl => {
+            println!("BootROM download mode (no password required).");
+        }
+        _ => {}
+    }
+    println!("The flashing scenario for the Amlogic mini is in development.");
+    println!("u-boot burning commands are available: capsula-jb aml \"<command>\"");
+    Ok(())
+}
+
+/// `capsula-jb aml`: identify the Amlogic board / pass a u-boot burning
+/// command through the download mode.
+fn run_amlogic(wait: Option<Duration>, cmd: Option<&str>) -> anyhow::Result<()> {
+    if cmd.is_none() {
+        println!(
+            "Connect the Amlogic mini and power it on: the u-boot download \
+             window is ~0.5 s at every boot; power-cycle to retry."
+        );
+    }
+    let p = progress::CliProgress::new();
+    let progress = |ev: Progress| p.handle(ev);
+    let (mut s, soc) = target::bring_up_amlogic(wait, &progress)?;
+    match cmd {
+        None => println!("{soc}"),
+        Some(c) => {
+            // the burning-command dispatcher exists only in the u-boot
+            // gadget; the BootROM does not answer AM_REQ_BULKCMD
+            if soc.stage() != amlogic::Stage::Tpl {
+                bail!(
+                    "the device is in the {} stage — burning commands are only                      available from the u-boot gadget; power-cycle the speaker                      to catch its download window",
+                    soc.stage().label()
+                );
+            }
+            let status = s.bulk_cmd(c)?;
+            println!("{status}");
+        }
+    }
+    Ok(())
+}
+
+/// Prepare the loader: ota/loader.bin from cache or a fresh OTA download.
+fn ensure_loader(config: &Config) -> anyhow::Result<LoaderContainer> {
+    let (container, version) =
+        ota::ensure_loader(Path::new("ota"), &config.ota.platform, &|step| match step {
+            ota::Step::Cached(path) => println!("loader: using cached {path}"),
+            ota::Step::Fetching(code) => println!("querying latest firmware for {code}..."),
+            ota::Step::Unpacking(path) => println!("extracting loader from OTA package {path}"),
+            ota::Step::Saved { path, version } => {
+                println!("loader saved: {path} (OTA {version})")
+            }
+        })
+        .context("failed to prepare the loader from the OTA")?;
+    if let Some(v) = version {
+        println!("loader OTA version: {v}");
+    }
+    Ok(container)
+}
+
 fn ask_yes() -> anyhow::Result<()> {
     use std::io::{IsTerminal, Write};
     // Non-interactive stdin (CI, LLM agent shells, redirected input):
@@ -212,36 +316,53 @@ fn ask_yes() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Live log of 2207:* bus events.
+/// Live log of the download-mode bus events, both vendors.
 fn monitor() -> anyhow::Result<()> {
-    let mut m = rockusb::DeviceMonitor::new();
-    println!("Rockchip USB monitor (2207:*), Ctrl-C to stop.");
-    m.poll()?;
-    if let Some(best) = rockusb::transport::DeviceMode::best(m.modes()) {
-        println!("on the bus now: {}", best.label());
+    println!("USB monitor (2207:* rockchip, 1b8e:c003 amlogic), Ctrl-C to stop.");
+    let mut rm = rockusb::DeviceMonitor::new();
+    let mut amlogic_on_bus = amlogic::present()?;
+    rm.poll()?;
+    if let Some(best) = rockusb::transport::DeviceMode::best(rm.modes()) {
+        println!(
+            "[{}] on the bus now: 2207:{:04x} ({})",
+            ts(),
+            best.pid(),
+            best.label()
+        );
+    }
+    if amlogic_on_bus {
+        println!(
+            "[{}] on the bus now: 1b8e:c003 (amlogic download mode)",
+            ts()
+        );
     }
     loop {
-        for ev in m.poll()? {
+        for ev in rm.poll()? {
             match ev {
-                rockusb::monitor::MonitorEvent::Appeared(mode) => {
-                    println!(
-                        "[{}] appeared 2207:{:04x} ({})",
-                        ts(),
-                        mode.pid(),
-                        mode.label()
-                    )
-                }
-                rockusb::monitor::MonitorEvent::Disappeared(mode) => {
-                    println!(
-                        "[{}] gone     2207:{:04x} ({})",
-                        ts(),
-                        mode.pid(),
-                        mode.label()
-                    )
-                }
+                rockusb::monitor::MonitorEvent::Appeared(mode) => println!(
+                    "[{}] appeared 2207:{:04x} ({})",
+                    ts(),
+                    mode.pid(),
+                    mode.label()
+                ),
+                rockusb::monitor::MonitorEvent::Disappeared(mode) => println!(
+                    "[{}] gone     2207:{:04x} ({})",
+                    ts(),
+                    mode.pid(),
+                    mode.label()
+                ),
             }
         }
-        std::thread::sleep(rockusb::monitor::POLL_INTERVAL);
+        let now = amlogic::present()?;
+        if now != amlogic_on_bus {
+            if now {
+                println!("[{}] appeared 1b8e:c003 (amlogic download mode)", ts());
+            } else {
+                println!("[{}] gone     1b8e:c003 (amlogic download mode)", ts());
+            }
+            amlogic_on_bus = now;
+        }
+        std::thread::sleep(jb_core::target::POLL_INTERVAL);
     }
 }
 

@@ -66,12 +66,16 @@ impl DeviceMode {
 /// Open the Rockchip device in the given mode (claim interface 0).
 /// Errors if the device is not present.
 pub fn open_mode(mode: &DeviceMode) -> Result<NusbTransport> {
-    Ok(NusbTransport::open_first(crate::USB_VID_ROCKCHIP, mode.pid(), |d| match mode {
-        // usbplug and MaskROM share the PID — told apart by iProduct
-        DeviceMode::UsbPlug => d.product_string() == Some("USB-MSC"),
-        DeviceMode::MaskRom => d.product_string() != Some("USB-MSC"),
-        _ => true,
-    })?)
+    Ok(NusbTransport::open_first(
+        crate::USB_VID_ROCKCHIP,
+        mode.pid(),
+        |d| match mode {
+            // usbplug and MaskROM share the PID — told apart by iProduct
+            DeviceMode::UsbPlug => d.product_string() == Some("USB-MSC"),
+            DeviceMode::MaskRom => d.product_string() != Some("USB-MSC"),
+            _ => true,
+        },
+    )?)
 }
 
 /// All Rockchip modes currently on the bus (deduplicated).

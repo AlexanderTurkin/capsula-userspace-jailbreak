@@ -1,25 +1,36 @@
 capsula-jb — quick start
 ========================
 
-1. Windows only: run DRIVER-SETUP.txt first (one-time USB driver install).
+1. Windows only: run DRIVER-SETUP.txt first (one-time USB driver install;
+   Rockchip 2207 for the big Capsulas / early minis, Amlogic 1B8E:C003
+   for the late minis).
    macOS note: if the binary is blocked after downloading, run
    `xattr -d com.apple.quarantine capsula-jb` (or see README).
    Linux note: for access without root, see the udev rules in README.
 
-2. Put the speaker into rockchip loader mode:
-   power off, peel off the bottom pad, connect micro-USB (OTG) to the
-   computer, hold the Recovery button (the lower of the two holes above
-   the micro-USB port) with a needle while powering on, release after a
-   few seconds. The board shows up as USB 2207:330d.
+2. Connect the speaker with a USB cable and run:
 
-3. Run:
    capsula-jb            (full scenario: dump -> adbd overlay -> reboot)
+
+   The tool waits for a supported board and dispatches automatically:
+
+   - Big Capsula (Capsule-14/15): power off, peel off the bottom pad,
+     connect micro-USB (OTG), hold the Recovery button (the lower of
+     the two holes above the micro-USB port) with a needle while
+     powering on, release after a few seconds. Shows up as 2207:330d.
+   - Capsula Mini on Rockchip: hold the touch button while powering on,
+     or use the debug UART console (see README).
+   - Capsula Mini on Amlogic (1b8e:c003): nothing to press — power the
+     speaker on with the cable connected; the stock u-boot raises its
+     download window on every boot for ~0.5 s and the tool catches it.
+     If it was missed, power-cycle the speaker again.
 
    Useful variants:
    capsula-jb backup     dump all partitions only, nothing is written
+   capsula-jb aml        Amlogic mini: identify / run u-boot commands
    capsula-jb --help     all options
 
-4. When the tool reports "ADB is up", connect over USB:
+3. When the tool reports "ADB is up" (Rockchip boards), connect over USB:
    adb devices && adb shell       (root shell, no authorization)
 
    The speaker also listens for ADB over the network once it is

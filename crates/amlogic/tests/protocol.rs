@@ -7,7 +7,6 @@ use amlogic::session::{BULK_REPLY_LEN, MEDIA_ACK_LEN, MEDIA_CHUNK};
 use amlogic::{soc::Stage, AmlogicSession, SocId};
 use usbcore::mock::{MockTransport, Step};
 
-
 fn session(steps: Vec<Step>) -> AmlogicSession<MockTransport> {
     AmlogicSession::new(MockTransport::new(steps), 0x81, 0x02)
 }
@@ -105,17 +104,12 @@ fn run_wire_format() {
 #[test]
 fn write_large_memory_wire_format() {
     let mut s = session(vec![
-        Step::ControlOut(
-            req::WR_LARGE_MEM,
-            0x0200,
-            3,
-            {
-                let mut h = [0u8; 16];
-                h[0..4].copy_from_slice(&0x01000000u32.to_le_bytes());
-                h[4..8].copy_from_slice(&0x0600u32.to_le_bytes());
-                h.to_vec()
-            },
-        ),
+        Step::ControlOut(req::WR_LARGE_MEM, 0x0200, 3, {
+            let mut h = [0u8; 16];
+            h[0..4].copy_from_slice(&0x01000000u32.to_le_bytes());
+            h[4..8].copy_from_slice(&0x0600u32.to_le_bytes());
+            h.to_vec()
+        }),
         Step::BulkOut((0u32..0x200).map(|b| b as u8).collect()),
         Step::BulkOut((0x200u32..0x400).map(|b| b as u8).collect()),
         Step::BulkOut({
@@ -138,17 +132,12 @@ fn write_large_memory_wire_format() {
 #[test]
 fn read_large_memory_wire_format() {
     let mut s = session(vec![
-        Step::ControlOut(
-            req::RD_LARGE_MEM,
-            0x0200,
-            2,
-            {
-                let mut h = [0u8; 16];
-                h[0..4].copy_from_slice(&0xd9000000u32.to_le_bytes());
-                h[4..8].copy_from_slice(&0x0400u32.to_le_bytes());
-                h.to_vec()
-            },
-        ),
+        Step::ControlOut(req::RD_LARGE_MEM, 0x0200, 2, {
+            let mut h = [0u8; 16];
+            h[0..4].copy_from_slice(&0xd9000000u32.to_le_bytes());
+            h[4..8].copy_from_slice(&0x0400u32.to_le_bytes());
+            h.to_vec()
+        }),
         Step::BulkIn(vec![0x11; 0x200]),
         Step::BulkIn(vec![0x22; 0x200]),
     ]);
@@ -309,16 +298,11 @@ fn upload_read_flow() {
 /// fill memory: pairs of (addr, value) LE words in the EP0 stage.
 #[test]
 fn fill_memory_wire_format() {
-    let mut s = session(vec![Step::ControlOut(
-        req::FILL_MEM,
-        0,
-        0,
-        {
-            let mut d = Vec::new();
-            d.extend_from_slice(&0xffd00000u32.to_le_bytes());
-            d.extend_from_slice(&0x1234u32.to_le_bytes());
-            d
-        },
-    )]);
+    let mut s = session(vec![Step::ControlOut(req::FILL_MEM, 0, 0, {
+        let mut d = Vec::new();
+        d.extend_from_slice(&0xffd00000u32.to_le_bytes());
+        d.extend_from_slice(&0x1234u32.to_le_bytes());
+        d
+    })]);
     s.fill_memory(&[(0xffd00000, 0x1234)]).unwrap();
 }

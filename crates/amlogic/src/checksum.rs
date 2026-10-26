@@ -14,9 +14,7 @@ pub fn add_sum(data: &[u8]) -> u32 {
     match chunks.remainder() {
         [a] => sum.wrapping_add(*a as u32),
         [a, b] => sum.wrapping_add(u16::from_le_bytes([*a, *b]) as u32),
-        [a, b, c] => {
-            sum.wrapping_add((*a as u32) | ((*b as u32) << 8) | ((*c as u32) << 16))
-        }
+        [a, b, c] => sum.wrapping_add((*a as u32) | ((*b as u32) << 8) | ((*c as u32) << 16)),
         _ => sum,
     }
 }
@@ -39,9 +37,6 @@ mod tests {
         assert_eq!(add_sum(&[0x22, 0x11]), 0x1122);
         assert_eq!(add_sum(&[0x33, 0x22, 0x11]), 0x112233);
         // a whole + tail mix
-        assert_eq!(
-            add_sum(&[1, 0, 0, 0, 0xff, 0xff, 0xff]),
-            1 + 0x00ffffff
-        );
+        assert_eq!(add_sum(&[1, 0, 0, 0, 0xff, 0xff, 0xff]), 1 + 0x00ffffff);
     }
 }

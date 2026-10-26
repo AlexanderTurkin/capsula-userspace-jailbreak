@@ -1,20 +1,30 @@
 # capsula-jb — root на колонках VK Capsula через перезапись userspace
 
-Джейлбрейк VK Capsula (Rockchip RK3308) методом перезаписи userspace:
+Джейлбрейк VK Capsula методом перезаписи userspace:
 раздел **userdata не подписан** и свободно перезаписывается
 пользователем — кладём в него оверлей с фабричным `adbd`, и после
 перезагрузки колонка видна как ADB-устройство (`2207:0006`):
 `adb shell` даёт **root без авторизации**. Остальные разделы не
 изменяются, стоковая прошивка продолжает работать как есть.
 
-Поддерживаемые платы: **Capsule-14, Capsule-15**. Лоадер для всех один — подписанный
-usbplug из OTA Capsule-14 (во всех актуальных прошивках rk3308 это одна
-и та же сборка), он скачивается и кешируется автоматически.
+Поддерживаемые платы:
+
+- **Capsule-14, Capsule-15** и **Capsula Мини на Rockchip RK3308B**
+  (ранняя ревизия `CapsulaDot_Main_V1.0`) — полный сценарий джейлбрейка.
+  Лоадер для всех один — подписанный usbplug из OTA Capsule-14 (во всех
+  актуальных прошивках rk3308 это одна и та же сборка), он скачивается
+  и кешируется автоматически.
+- **Capsula Мини на Amlogic A113X** (поздняя ревизия `MRC02B_Main`,
+  `1b8e:c003`) — распознавание платы, bring-up в download-режим u-boot и
+  passthrough команд u-boot (`capsula-jb aml`); сценарий прошивки для
+  этой платы в разработке. Стоковый u-boot поднимает фабричное
+  download-окно при каждом включении (~0.5 с) и не запаролен —
+  инструмент ловит его сам, разбирать колонку не нужно.
 
 `capsula-jb` — самодостаточный кроссплатформенный инструмент (Linux,
-Windows, macOS): Rockchip USB-протоколы, форматы OTA и ext2/3/4
-реализованы нативно на Rust — без libusb, rkdeveloptool, e2fsprogs и
-без root (с udev-правилами на Linux).
+Windows, macOS): Rockchip USB-протоколы, протокол Amlogic update,
+форматы OTA и ext2/3/4 реализованы нативно на Rust — без libusb,
+rkdeveloptool, e2fsprogs и без root (с udev-правилами на Linux).
 
 ## Установка
 
@@ -25,7 +35,8 @@ Windows, macOS): Rockchip USB-протоколы, форматы OTA и ext2/3/4
 
 - **Windows**: распакуйте архив, один раз выполните
   `DRIVER-SETUP.txt` (установка WinUSB-драйвера для VID 2207 —
-  DriverAssistant из вложенного `RockchipUSBDriver.zip`), затем
+  DriverAssistant из вложенного `RockchipUSBDriver.zip`; для Amlogic
+  мини нужен ещё драйвер на VID 1B8E, см. DRIVER-SETUP.txt), затем
   запускайте `capsula-jb.exe`.
 - **macOS**: если бинарник заблокирован Gatekeeper после скачивания
   браузером — `xattr -d com.apple.quarantine capsula-jb`.
@@ -52,14 +63,19 @@ capsula-jb backup
 
 ## Сценарий (команда по умолчанию)
 
-1. **Лоадер**: скачивается OTA Capsule-14, из неё извлекается
+0. **Ожидание платы**: инструмент предлагает подключить колонку кабелем
+   и подать питание и следит за шиной — что подключится (Rockchip в
+   download-режиме или Amlogic мини), такой путь и выбирается. Для
+   Rockchip-плат: войдите в режим rockchip loader (подсказка печатается
+   во время ожидания, инструмент подхватывает плату сам). Для Amlogic
+   мини: просто включите колонку при подключённом кабеле — u-boot сам
+   поднимает download-окно.
+1. **Лоадер** (Rockchip): скачивается OTA Capsule-14, из неё извлекается
    подписанный лоадер; кеш — `ota/loader.bin` (при наличии кеша ничего
    не качается). Лоадер один на все поддерживаемые платы.
 2. **Плата**: ждём появления устройства в режиме rockchip loader
-   (`2207:330d`/`330e`) — инструмент печатает подсказку, как войти в
-   режим на большой Капсуле и на мини, и подхватывает плату сам.
-   Загружаем наш usbplug в RAM (флеш не трогается), сверяем сигнатуры
-   в DRAM.
+   (`2207:330d`/`330e`). Загружаем наш usbplug в RAM (флеш не трогается),
+   сверяем сигнатуры в DRAM.
 3. **Дамп**: RAM-патчем поднимаем предел чтения usbplug (обход маски
    0xCC — без патча всё выше 32 МиБ читается как 0xCC) и снимаем
    полный дамп всех GPT-разделов в `backup/` с SHA256-суммами.
@@ -118,6 +134,35 @@ docker/adbd && docker run --rm -v docker/adbd:/work capsula-adbd
 разъёма питания) и, удерживая, подать питание; отпустить через
 несколько секунд. Плата появляется как `2207:330d`.
 
+**Capsula Мини на Rockchip:** кнопки Recovery нет. Зажать сенсорную
+кнопку при подаче питания, либо Ctrl+D в UART-консоли с подключённым
+OTG (rockusb, `2207:330d`), либо Ctrl+B (MaskROM, `2207:330e`).
+
+**Capsula Мини на Amlogic:** ничего нажимать не нужно — стоковый u-boot
+при каждом включении поднимает фабричный download-режим (`1b8e:c003`)
+примерно на полсекунды; запущенный `capsula-jb` ловит это окно сам. Окно
+пропущено — выключите и снова включите питание при подключённом кабеле.
+
+## Amlogic мини (`capsula-jb aml`)
+
+Поздние ревизии Capsula Мини (плата MRC02B, SoC Amlogic A113X) видны
+на шине как `1b8e:c003` в двух стадиях: BootROM и u-boot burning gadget
+(фабричный download-режим u-boot, который и появляется при каждом
+старте). Протокол реализован нативно (vendor-запросы EP0 + bulk,
+wire-формат сверен с device-стороной u-boot v2_burning и pyamlboot):
+
+```sh
+capsula-jb aml                              # identify платы (стадия, версия)
+capsula-jb aml "printenv bootdelay"         # выполнить команду u-boot
+capsula-jb monitor                          # события шины обоих вендоров
+```
+
+Команды идут через AM_REQ_BULKCMD в диспетчер burning-команд u-boot
+(`download`/`upload`/`verify`/`saveenv`/...) — их вывод виден на
+UART-консоли. Сценария прошивки для Amlogic-плат пока нет: разделы
+мини на UBI с вендорской ECC, и безопасная запись потребует отдельной
+работы.
+
 ## Подключение: USB и Wi-Fi
 
 Наш adbd слушает USB-гаджет и TCP **одновременно** — колонка доступна
@@ -165,7 +210,10 @@ adb shell
   чистый ext2 и положить только оверлей (существующее содержимое
   userdata теряется; выручает, если раздел на плате не отформатирован
   или его ФС не читается);
-- `capsula-jb monitor` — живой лог событий `2207:*` на шине;
+- `capsula-jb monitor` — живой лог событий download-режимов на шине
+  (`2207:*` Rockchip и `1b8e:c003` Amlogic);
+- `capsula-jb aml "<u-boot команда>"` — passthrough команд u-boot на
+  Amlogic мини (см. раздел выше);
 - ADB по Wi-Fi: см. раздел «Подключение: USB и Wi-Fi»;
 - Linux без root: `sudo cp resources/udev/99-capsula-jailbreak.rules
   /etc/udev/rules.d/ && sudo udevadm control --reload`.
@@ -174,15 +222,23 @@ adb shell
 
 ```
 crates/
+  usbcore/    Общий USB-слой: транспорт nusb (WinUSB на Windows) —
+              vendor control/bulk, мок для тестов. Переиспользуется
+              всеми вендорскими стеками.
   rockusb/    Rockchip USB-стек: MaskROM DownloadBoot (0x471/0x472),
-              rockusb CBW/CSW (чтение/запись LBA и RAM), монитор шины.
-              Нативный порт xrock поверх nusb; транспорт мокается.
+              rockusb CBW/CSW (чтение/запись LBA и RAM), режимы и
+              монитор шины 2207:*. Нативный порт xrock.
+  amlogic/    Amlogic update-протокол (1b8e:c003): identify/стадии,
+              память (простая/крупная), run, bulkcmd/tplcmd, media
+              download/upload с add_sum; порт wire-формата update-тула
+              (device-сторона: u-boot v2_burning, host: pyamlboot).
   jb-core/    Домен: конфигурация, GPT, дамп (RAM-патч 0xCC),
-              OTA/RKFW, оверлей userdata (ext4-lwext4), запись раздела.
+              OTA/RKFW, оверлей userdata (ext4-lwext4), запись раздела;
+              unified wait/dispatch по вендорам (target.rs).
   jb-cli/     capsula-jb — CLI.
 resources/
   config.toml Общая конфигурация: код OTA, константы RAM-патча usbplug,
-              подсказки по входу в download-режим.
+              подсказки по входу в download-режимы (оба вендора).
   overlay/    adbd + флаг USB-гаджета (вшиваются в userdata).
 ```
 

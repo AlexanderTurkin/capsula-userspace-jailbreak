@@ -13,10 +13,11 @@ pub mod gpt;
 pub mod ota;
 pub mod rkfw;
 pub mod session;
+pub mod target;
 pub mod userdata;
 
-/// SoC backend identity. Rockchip only today; the contract is kept for
-/// a future Amlogic backend.
+/// SoC backend identity. Implemented by the vendor stacks the tool
+/// dispatches between (rockchip today, amlogic for the late minis).
 pub trait SocBackend {
     /// Human-readable vendor name.
     fn name(&self) -> &'static str;

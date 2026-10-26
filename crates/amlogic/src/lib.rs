@@ -29,17 +29,25 @@ pub mod error;
 pub mod session;
 pub mod soc;
 
+use nusb::MaybeFuture;
+
 pub use checksum::add_sum;
 pub use error::{Error, Result};
-pub use session::{
-    AmlogicSession, BULK_REPLY_LEN, MEDIA_ACK_LEN, MEDIA_CHUNK,
-};
+pub use session::{AmlogicSession, BULK_REPLY_LEN, MEDIA_ACK_LEN, MEDIA_CHUNK};
 pub use soc::{SocId, Stage, STAGE_MINOR_IPL, STAGE_MINOR_SPL, STAGE_MINOR_TPL};
 
 /// USB VID of all Amlogic download modes.
 pub const USB_VID_AMLOGIC: u16 = 0x1b8e;
 /// Download-mode PID (BootROM and the u-boot burning gadget alike).
 pub const USB_PID_UPDATE: u16 = 0xc003;
+
+/// Whether an Amlogic download-mode device is on the bus right now
+/// (enumeration only, the device is not opened).
+pub fn present() -> usbcore::Result<bool> {
+    Ok(nusb::list_devices()
+        .wait()?
+        .any(|d| d.vendor_id() == USB_VID_AMLOGIC && d.product_id() == USB_PID_UPDATE))
+}
 
 /// Vendor request codes of the update protocol (EP0, recipient device).
 pub mod req {

@@ -77,8 +77,7 @@ impl Transport for MockTransport {
                     return Err(Error::Usb("mock: control_in would overflow".into()));
                 }
                 buf[..answer.len()].copy_from_slice(&answer);
-                self.log
-                    .push(format!("ctrl-in {r:#x} {}b", answer.len()));
+                self.log.push(format!("ctrl-in {r:#x} {}b", answer.len()));
                 Ok(answer.len())
             }
             other => Err(Error::Usb(format!(

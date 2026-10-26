@@ -1,12 +1,23 @@
 One-time USB driver setup for Windows
-======================================
+=====================================
 
 capsula-jb talks to the speaker over USB and on Windows this requires a
-WinUSB-class driver for the Rockchip vendor ID (2207). The bundled
-RockchipUSBDriver.zip contains the official Rockchip DriverAssistant
-that installs it for all Rockchip device modes.
+WinUSB-class driver.
 
-Steps:
+- Rockchip boards (Capsule-14/15, early minis): the Rockchip vendor ID
+  is 2207. The bundled RockchipUSBDriver.zip contains the official
+  Rockchip DriverAssistant that installs it for all Rockchip device
+  modes.
+- Amlogic minis (late Capsula Mini revisions, MRC02B board): the
+  download device is USB 1B8E:C003 ("WorldCup Device"). Install the
+  driver from the official Amlogic USB Burning Tool package (WorldCup
+  Device), or bind WinUSB to it once with Zadig (https://zadig.akeo.ie):
+  Options -> List All Devices -> "WorldCup Device" (or 1B8E:C003) ->
+  target driver WinUSB -> Install. The device only exists on the bus
+  while the speaker is in its download window, so install the driver
+  before power-cycling the speaker.
+
+Rockchip steps:
 
 1. Unpack RockchipUSBDriver.zip to any folder.
 2. Run DriverInstall.exe from the unpacked DriverAssitant_v5.14 folder
@@ -18,7 +29,8 @@ Steps:
 
 Notes:
 
-- The driver is a one-time install; capsula-jb updates do not repeat it.
+- The drivers are a one-time install; capsula-jb updates do not repeat
+  it.
 - DriverAssistant only installs USB drivers; it does not touch disks,
   firmware or anything else.
 - No internet connection is required for the install.

@@ -48,10 +48,11 @@ impl AmlogicSession<usbcore::NusbTransport> {
     /// Open the first `1b8e:c003` device (either download stage) and
     /// claim interface 0.
     pub fn open() -> Result<Self> {
-        let t =
-            usbcore::NusbTransport::open_first(crate::USB_VID_AMLOGIC, crate::USB_PID_UPDATE, |_| {
-                true
-            })?;
+        let t = usbcore::NusbTransport::open_first(
+            crate::USB_VID_AMLOGIC,
+            crate::USB_PID_UPDATE,
+            |_| true,
+        )?;
         let (ep_in, ep_out) = (t.ep_in, t.ep_out);
         Ok(AmlogicSession::new(t, ep_in, ep_out))
     }
@@ -154,12 +155,7 @@ impl<T: Transport> AmlogicSession<T> {
             let mut head = [0u8; 16];
             head[0..4].copy_from_slice(&(addr + off as u32).to_le_bytes());
             head[4..8].copy_from_slice(&(len as u32).to_le_bytes());
-            self.ctrl_out(
-                req::WR_LARGE_MEM,
-                block_len as u16,
-                blocks as u16,
-                &head,
-            )?;
+            self.ctrl_out(req::WR_LARGE_MEM, block_len as u16, blocks as u16, &head)?;
             for b in 0..blocks {
                 let start = off + b * block_len;
                 let end = (start + block_len).min(data.len());
@@ -181,7 +177,7 @@ impl<T: Transport> AmlogicSession<T> {
     /// [`AmlogicSession::upload_read`] (bulkcmd `upload mem`).
     pub fn read_large_memory(&mut self, addr: u32, buf: &mut [u8], block_len: usize) -> Result<()> {
         assert!((1..=0x1000).contains(&block_len), "block_len 1..0x1000");
-        if buf.len() % block_len != 0 {
+        if !buf.len().is_multiple_of(block_len) {
             return Err(Error::Usb("length must be a multiple of block_len".into()));
         }
         let mut off = 0;
@@ -192,12 +188,7 @@ impl<T: Transport> AmlogicSession<T> {
             let mut head = [0u8; 16];
             head[0..4].copy_from_slice(&(addr + off as u32).to_le_bytes());
             head[4..8].copy_from_slice(&(len as u32).to_le_bytes());
-            self.ctrl_out(
-                req::RD_LARGE_MEM,
-                block_len as u16,
-                blocks as u16,
-                &head,
-            )?;
+            self.ctrl_out(req::RD_LARGE_MEM, block_len as u16, blocks as u16, &head)?;
             for b in 0..blocks {
                 let start = off + b * block_len;
                 self.transport
