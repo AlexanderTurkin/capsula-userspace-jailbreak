@@ -364,6 +364,14 @@ fn run_aml_env(wait: Option<Duration>) -> anyhow::Result<()> {
 }
 
 /// `capsula-jb aml-dump <part>`: stream a vendor partition into backup/.
+///
+/// The dump rides the `reboot update` window: the cold-boot window dies
+/// on a ~450 ms deadline nothing we send can cancel, but reboot-update
+/// runs `usb_burning=update 1000` with no auto-burn deadline at all.
+/// The first caught session jumps there; if a session still dies, the
+/// loop reboots back and continues from the checkpoint (adaptive: the
+/// per-session time budget grows while sessions survive, so a stable
+/// window ends up dumping without any reboots).
 fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
     println!(
         "Connect the Amlogic mini and power it on: the u-boot download \
@@ -372,11 +380,73 @@ fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
     let p = progress::CliProgress::new();
     let progress = |ev: Progress| p.handle(ev);
     let (mut s, _soc) = target::bring_up_amlogic(wait, &progress)?;
-    let out = Path::new("backup");
-    let got = jb_core::aml::dump_partition(&mut s, part, out, &progress)?;
+
+    let mut st = jb_core::aml::DumpState::new(part)?;
+    progress(Progress::PartitionStart {
+        name: part.into(),
+        sectors: st.size as u64 / 512,
+    });
+
+    // jump from the deadlined cold-boot window into the update window
+    println!("entering the reboot-update download window...");
+    jb_core::aml::reboot_into_update(&mut s);
+    drop(s);
+    std::thread::sleep(Duration::from_secs(2));
+    let (mut s, _soc) = target::bring_up_amlogic(wait, &progress)?;
+
+    // per-session budget: starts safe, grows x4 for every session that
+    // survives its budget; an immortal window ends up never rebooting
+    let mut budget = Duration::from_millis(250);
+    let mut sessions_alive = 0u32;
+    const CHUNK: usize = 256 * 1024;
+
+    loop {
+        let t0 = std::time::Instant::now();
+        let mut got_any = false;
+        while st.done() < st.size && !st.short_read && t0.elapsed() < budget {
+            match jb_core::aml::dump_chunk(&mut s, &mut st, CHUNK, &progress) {
+                Ok(0) => break,
+                Ok(_) => got_any = true,
+                Err(e) => {
+                    if got_any || st.done() == 0 && sessions_alive == 0 {
+                        // mid-chunk transport death — session over
+                        log::warn!("session died: {e}");
+                    }
+                    break;
+                }
+            }
+        }
+        if st.done() >= st.size || st.short_read {
+            break;
+        }
+        if t0.elapsed() < budget {
+            // died before the budget: the window is NOT deadline-free
+            sessions_alive = 0;
+            budget = Duration::from_millis(250);
+        } else {
+            sessions_alive += 1;
+            if sessions_alive >= 2 {
+                budget = budget.saturating_mul(8);
+                sessions_alive = 0;
+            }
+        }
+        // reboot back into the update window and continue
+        jb_core::aml::reboot_into_update(&mut s);
+        drop(s);
+        std::thread::sleep(Duration::from_secs(2));
+        let (ns, _soc) = target::bring_up_amlogic(wait, &progress)?;
+        s = ns;
+    }
+
+    jb_core::aml::write_dump(Path::new("backup"), part, &st.data, &progress)?;
+    let note = if st.short_read {
+        " (short read: bad blocks — the received length is the truth)"
+    } else {
+        ""
+    };
     println!(
-        "done: backup/{part}.bin, {} (nothing was written to the device)",
-        humansize(got)
+        "done: backup/{part}.bin, {}{note} (nothing was written to the device)",
+        humansize(st.done() as u64)
     );
     Ok(())
 }

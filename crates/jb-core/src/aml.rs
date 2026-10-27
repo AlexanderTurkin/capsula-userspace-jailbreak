@@ -36,12 +36,92 @@ pub fn capture_env<T: usbcore::Transport>(s: &mut AmlogicSession<T>) -> anyhow::
     Ok(text.to_string())
 }
 
+/// Incremental partition dump state: survives session reconnects (the
+/// dump loop re-enters the download window via `reboot update` and
+/// continues from the checkpoint).
+pub struct DumpState {
+    pub part: String,
+    pub off: u32,
+    pub size: usize,
+    pub data: Vec<u8>,
+    /// Set when a `nand read` failed mid-partition: the received prefix
+    /// is the truth (bad blocks; flasher.sh `readable_size`).
+    pub short_read: bool,
+}
+
+impl DumpState {
+    pub fn new(part: &str) -> anyhow::Result<DumpState> {
+        let (_, off, size) = amlogic::partition(part).ok_or_else(|| {
+            anyhow::anyhow!("unknown partition {part:?}; known: {}", known_parts())
+        })?;
+        Ok(DumpState {
+            part: part.into(),
+            off,
+            size: size as usize,
+            data: Vec::with_capacity(size as usize),
+            short_read: false,
+        })
+    }
+
+    pub fn done(&self) -> usize {
+        self.data.len()
+    }
+}
+
+/// Dump the next `max_bytes` of the partition through the live session.
+/// Returns the number of bytes added; on a transport error the caller
+/// reconnects (`reboot update`) and calls again.
+pub fn dump_chunk<T: usbcore::Transport>(
+    s: &mut AmlogicSession<T>,
+    st: &mut DumpState,
+    max_bytes: usize,
+    progress: ProgressFn,
+) -> anyhow::Result<usize> {
+    let remaining = st.size - st.done();
+    if remaining == 0 || st.short_read {
+        return Ok(0);
+    }
+    let want = remaining.min(max_bytes);
+    let base_done = st.done() as u64;
+    let total = st.size as u64;
+    let part = st.part.clone();
+    match s.read_nand_range(st.off + st.done() as u32, want, &|d| {
+        progress(Progress::PartitionProgress {
+            name: part.clone(),
+            done: base_done + d as u64,
+            total,
+        });
+    }) {
+        Ok(chunk) => {
+            let short = chunk.len() < want;
+            st.short_read = short;
+            st.data.extend_from_slice(&chunk);
+            Ok(chunk.len())
+        }
+        Err(e) => {
+            // a bad-block read failure after a good prefix returns the
+            // prefix; an empty prefix is a real error (caller retries)
+            Err(anyhow::anyhow!("read {:#x}+{:#x}: {e}", st.off, st.done()))
+        }
+    }
+}
+
+/// Re-enter the download mode via `reboot update`: the cold-boot window
+/// (`try_auto_burn=update 700 450`) carries both timeouts, while the
+/// reboot-update path runs `usb_burning=update 1000` whose single
+/// argument makes do_v2_usbtool DELETE identifyWaitTime — no auto-burn
+/// deadline is armed, and the 1 s connect timeout is cancelled by the
+/// host's SetConfiguration during enumeration. Best effort: the device
+/// disconnects while rebooting.
+pub fn reboot_into_update<T: usbcore::Transport>(s: &mut AmlogicSession<T>) {
+    let _ = s.bulk_cmd("reboot update");
+}
+
 /// Dump a vendor partition by name into `dir/<part>.bin`, through the
 /// raw NAND offsets (nand read -> DRAM -> upload mem; flasher.sh
-/// `read_big_from_flash`). A `nand read` across a bad block fails after
-/// the good prefix — the received prefix is kept, matching the flasher:
-/// the received length is the truth. Returns the number of bytes
-/// written.
+/// `read_big_from_flash`). A short read (bad blocks) is kept, matching
+/// the flasher: the received length is the truth. Returns the number of
+/// bytes written.
 pub fn dump_partition<T: usbcore::Transport>(
     s: &mut AmlogicSession<T>,
     part: &str,
@@ -63,12 +143,18 @@ pub fn dump_partition<T: usbcore::Transport>(
             });
         })
         .map_err(|e| anyhow::anyhow!("dump {part} at {off:#x}: {e}"))?;
+    write_dump(dir, part, &data, progress)?;
+    Ok(data.len() as u64)
+}
+
+/// Write the accumulated dump with its progress events.
+pub fn write_dump(dir: &Path, part: &str, data: &[u8], progress: ProgressFn) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{part}.bin"));
     let mut f = std::fs::File::create(&path)?;
-    f.write_all(&data)?;
+    f.write_all(data)?;
     progress(Progress::PartitionDone { name: part.into() });
-    Ok(data.len() as u64)
+    Ok(())
 }
 
 fn known_parts() -> String {
