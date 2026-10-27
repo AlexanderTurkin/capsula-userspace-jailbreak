@@ -340,8 +340,8 @@ fn upload_store_stream() {
         r[..7].copy_from_slice(b"success");
         r
     }
-    // total 0x15000: fetch 0xffff then 0x5001
-    let mut steps = vec![
+    // total 0x15000: fetch 0x8000 + 0x8000 + 0x5000
+    let steps = vec![
         Step::ControlOut(
             req::BULKCMD,
             0,
@@ -349,17 +349,19 @@ fn upload_store_stream() {
             b"upload store data normal 0x15000\0".to_vec(),
         ),
         Step::BulkIn(ok()),
-        Step::ControlIn(req::READ_MEDIA, 0xffff, 16, head(0x5001, 0)),
-        Step::BulkIn(vec![0xa5; 0xffff]),
-        Step::ControlIn(req::READ_MEDIA, 0x5001, 6, head(0, 1)),
-        Step::BulkIn(vec![0x5a; 0x5001]),
+        Step::ControlIn(req::READ_MEDIA, 0x8000, 8, head(0xd000, 0)),
+        Step::BulkIn(vec![0xa5; 0x8000]),
+        Step::ControlIn(req::READ_MEDIA, 0x8000, 8, head(0x5000, 1)),
+        Step::BulkIn(vec![0xa3; 0x8000]),
+        Step::ControlIn(req::READ_MEDIA, 0x5000, 5, head(0, 2)),
+        Step::BulkIn(vec![0x5a; 0x5000]),
     ];
-    let _ = &mut steps;
     let mut s = session(steps);
     let data = s.upload_store("data", 0x15000, &|_| {}).unwrap();
     assert_eq!(data.len(), 0x15000);
     assert_eq!(&data[..4], &[0xa5; 4][..]);
-    assert_eq!(&data[0xffff..0xffff + 4], &[0x5a; 4][..]);
+    assert_eq!(&data[0x8000..0x8004], &[0xa3; 4][..]);
+    assert_eq!(&data[0x10000..0x10004], &[0x5a; 4][..]);
 }
 
 /// upload_store keeps a short stream when the device reports no data
@@ -377,11 +379,11 @@ fn upload_store_short_read_kept() {
             b"upload store data normal 0x20000\0".to_vec(),
         ),
         Step::BulkIn(ok),
-        Step::ControlIn(req::READ_MEDIA, 0xffff, 16, std::mem::take(&mut h)),
-        Step::BulkIn(vec![0x33; 0xffff]),
+        Step::ControlIn(req::READ_MEDIA, 0x8000, 8, std::mem::take(&mut h)),
+        Step::BulkIn(vec![0x33; 0x8000]),
     ]);
     let data = s.upload_store("data", 0x20000, &|_| {}).unwrap();
-    assert_eq!(data.len(), 0xffff); // short, but kept
+    assert_eq!(data.len(), 0x8000); // short, but kept
 }
 
 /// read_dram chunks the range into independent upload-mem arms.

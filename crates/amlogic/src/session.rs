@@ -426,7 +426,9 @@ impl<T: Transport> AmlogicSession<T> {
             .map(|_| ())?;
         let mut out = Vec::with_capacity(total);
         while out.len() < total {
-            let want = (total - out.len()).min(0xffff);
+            // 0x8000 steps: a ~64 KiB fetch breaks the pipe on real
+            // hardware (IOKit submit failure), 32 KiB is proven fine
+            let want = (total - out.len()).min(UPLOAD_CHUNK);
             let (data, head) = self.read_media_head(want)?;
             let left = u32::from_le_bytes(head[4..8].try_into().unwrap()) as usize;
             if data.is_empty() {
