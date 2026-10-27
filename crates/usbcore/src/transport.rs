@@ -65,6 +65,16 @@ impl NusbTransport {
     /// Open an exact DeviceInfo (to pick a specific instance).
     pub fn open_device_info(info: &nusb::DeviceInfo) -> Result<Self> {
         let device = info.open().wait()?;
+        // Explicitly SET CONFIGURATION(1). Linux does it during
+        // enumeration; macOS does not — and download-mode gadgets rely
+        // on it to cancel their "wait for PC" timeout (the Amlogic
+        // u-boot burning gadget exits ~700 ms after start unless it
+        // sees SetConfig, killing the session mid-transfer).
+        if let Err(e) = device.set_configuration(1).wait() {
+            // already-configured devices reject this; anything else is
+            // still worth a try before claiming
+            log::debug!("set_configuration(1): {e} (continuing)");
+        }
         let interface = match device.claim_interface(0).wait() {
             Ok(i) => i,
             Err(_) => device.detach_and_claim_interface(0).wait()?,
