@@ -231,11 +231,23 @@ impl<T: Transport> AmlogicSession<T> {
     }
 
     /// Sacrificial command right after identify: the first bulkcmd of a
-    /// session can lose its leading bytes (flasher.sh `prime_bulk`), so
-    /// its answer — if any — means nothing. Always call this once after
-    /// identify and ignore the result.
+    /// session can lose its leading bytes (flasher.sh `prime_bulk`), and
+    /// on a freshly caught device the bulk pipes may not be ready yet
+    /// (IOKit kIOUSBUnknownPipeErr) — so this also retries until the
+    /// bulk path answers. The semantic result is ignored either way.
     pub fn prime(&mut self) {
-        let _ = self.bulk_cmd("echo");
+        for attempt in 0..3 {
+            match self.bulk_cmd("echo") {
+                // the pipe works — the reply text is meaningless here
+                Ok(_) | Err(Error::CommandFailed(_)) => return,
+                Err(_) => {
+                    if attempt == 2 {
+                        return;
+                    }
+                    sleep(Duration::from_millis(100));
+                }
+            }
+        }
     }
 
     /// Poll the bulk status until the running command finishes.

@@ -165,6 +165,9 @@ fn open_and_identify(
     let t = Instant::now();
     let mut s = AmlogicSession::open()?;
     let opened = t.elapsed();
+    // let IOKit finish building the interface pipes before the first
+    // bulk transfer (kIOUSBUnknownPipeErr on a too-fresh device)
+    std::thread::sleep(Duration::from_millis(50));
     let soc = s.identify()?;
     // The first bulkcmd of a session can lose its leading bytes
     // (flasher.sh prime_bulk): sacrifice a command nobody needs.
