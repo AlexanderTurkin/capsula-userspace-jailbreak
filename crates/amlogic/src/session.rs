@@ -423,6 +423,11 @@ impl<T: Transport> AmlogicSession<T> {
         let mut out = vec![0u8; len];
         let mut done = 0usize;
         while done < len {
+            // identify doubles as the keepalive: the vendor tool
+            // identifies before every operation and its sessions outlive
+            // the gadget's ~450 ms deadline — one cheap control transfer
+            // per chunk restarts it
+            let _ = self.identify();
             let n = (len - done).min(UPLOAD_CHUNK);
             if let Err(e) = self.nand_read(crate::RAM_SCRATCH, off + done as u32, n) {
                 if done == 0 {

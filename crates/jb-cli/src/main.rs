@@ -296,6 +296,15 @@ fn run_amlogic(wait: Option<Duration>, cmds: &[String]) -> anyhow::Result<()> {
             std::thread::sleep(Duration::from_millis(ms));
             continue;
         }
+        // "id": one identify — the candidate keepalive (the vendor tool
+        // identifies before every operation; if each identify restarts
+        // the gadget's ~450 ms deadline, periodic identifies make the
+        // session immortal)
+        if c == "id" {
+            let soc = s.identify()?;
+            println!("id -> {soc} (+{}ms)", t0.elapsed().as_millis());
+            continue;
+        }
         let r = if let Some((addr, size)) = parse_upload_cmd(c) {
             println!("uploading {size:#x} bytes from {addr:#x}...");
             s.upload_read(addr, size).map(|data| {

@@ -443,6 +443,8 @@ fn read_nand_range_steps() {
     let mut steps = vec![];
     for (i, fill) in [0x11u8, 0x22].iter().enumerate() {
         let off = 0x0b20_0000 + i * amlogic::UPLOAD_CHUNK;
+        // the loop identifies as its keepalive before every chunk
+        steps.push(Step::ControlIn(req::IDENTIFY_HOST, 0, 0, vec![0, 7, 1, 16]));
         steps.push(Step::ControlOut(
             req::BULKCMD,
             0,
