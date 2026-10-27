@@ -67,11 +67,14 @@ enum Command {
     Backup,
     /// Live log of the download-mode USB events (2207:* and 1b8e:c003)
     Monitor,
-    /// Amlogic mini: identify the board / run a u-boot burning command
+    /// Amlogic mini: identify the board / run u-boot burning commands
     Aml {
-        /// u-boot burning command to execute, e.g. "printenv bootdelay";
-        /// omit to identify the board only
-        cmd: Option<String>,
+        /// u-boot burning commands to execute in sequence (the whole
+        /// batch lives within one download window), e.g. "printenv".
+        /// "upload mem <addr> normal <size>" streams the memory back and
+        /// prints a hexdump. Omit to identify the board only.
+        #[arg(allow_hyphen_values = true)]
+        cmds: Vec<String>,
     },
 }
 
@@ -87,7 +90,7 @@ fn main() -> anyhow::Result<()> {
         None => run_jailbreak(wait, cli.yes, cli.format_userdata),
         Some(Command::Backup) => run_backup(wait),
         Some(Command::Monitor) => monitor(),
-        Some(Command::Aml { cmd }) => run_amlogic(wait, cmd.as_deref()),
+        Some(Command::Aml { cmds }) => run_amlogic(wait, &cmds),
     }
 }
 
@@ -245,10 +248,12 @@ fn amlogic_scenario(wait: Option<Duration>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `capsula-jb aml`: identify the Amlogic board / pass a u-boot burning
-/// command through the download mode.
-fn run_amlogic(wait: Option<Duration>, cmd: Option<&str>) -> anyhow::Result<()> {
-    if cmd.is_none() {
+/// `capsula-jb aml`: identify the Amlogic board / pass u-boot burning
+/// commands through the download mode. The whole batch runs within one
+/// caught window; `upload mem <addr> normal <size>` streams the memory
+/// back and prints a hexdump.
+fn run_amlogic(wait: Option<Duration>, cmds: &[String]) -> anyhow::Result<()> {
+    if cmds.is_empty() {
         println!(
             "Connect the Amlogic mini and power it on: the u-boot download \
              window is ~0.5 s at every boot; power-cycle to retry."
@@ -257,22 +262,86 @@ fn run_amlogic(wait: Option<Duration>, cmd: Option<&str>) -> anyhow::Result<()> 
     let p = progress::CliProgress::new();
     let progress = |ev: Progress| p.handle(ev);
     let (mut s, soc) = target::bring_up_amlogic(wait, &progress)?;
-    match cmd {
-        None => println!("{soc}"),
-        Some(c) => {
-            // the burning-command dispatcher exists only in the u-boot
-            // gadget; the BootROM does not answer AM_REQ_BULKCMD
-            if soc.stage() != amlogic::Stage::Tpl {
+    if cmds.is_empty() {
+        println!("{soc}");
+        return Ok(());
+    }
+    // the burning-command dispatcher exists only in the u-boot gadget;
+    // the BootROM does not answer AM_REQ_BULKCMD
+    if soc.stage() != amlogic::Stage::Tpl {
+        bail!(
+            "the device is in the {} stage — burning commands are only \
+             available from the u-boot gadget; power-cycle the speaker to \
+             catch its download window",
+            soc.stage().label()
+        );
+    }
+    let t0 = std::time::Instant::now();
+    for c in cmds {
+        let r = if let Some((addr, size)) = parse_upload_cmd(c) {
+            println!("uploading {size:#x} bytes from {addr:#x}...");
+            s.upload_read(addr, size).map(|data| {
+                hexdump(&data, addr);
+                format!("done (+{}ms)", t0.elapsed().as_millis())
+            })
+        } else {
+            s.bulk_cmd(c)
+                .map(|st| format!("{st} (+{}ms)", t0.elapsed().as_millis()))
+        };
+        match r {
+            Ok(status) => println!("{c} -> {status}"),
+            Err(e) => {
+                let on_bus = amlogic::present().unwrap_or(false);
                 bail!(
-                    "the device is in the {} stage — burning commands are only                      available from the u-boot gadget; power-cycle the speaker                      to catch its download window",
-                    soc.stage().label()
+                    "command {c:?} failed at +{}ms ({e}); the device is {}",
+                    t0.elapsed().as_millis(),
+                    if on_bus {
+                        "still on the bus (transfer problem)"
+                    } else {
+                        "gone from the bus (the download window closed mid-command)"
+                    }
                 );
             }
-            let status = s.bulk_cmd(c)?;
-            println!("{status}");
         }
     }
     Ok(())
+}
+
+/// Parse the `upload mem <addr> normal <size>` burning command.
+fn parse_upload_cmd(c: &str) -> Option<(u32, usize)> {
+    let t: Vec<&str> = c.split_whitespace().collect();
+    if t.len() != 5 || t[0] != "upload" || t[1] != "mem" || t[3] != "normal" {
+        return None;
+    }
+    let addr = u32::from_str_radix(t[2].trim_start_matches("0x"), 16).ok()?;
+    let size = usize::from_str_radix(t[4].trim_start_matches("0x"), 16).ok()?;
+    if size == 0 || size > 0xffff {
+        return None;
+    }
+    Some((addr, size))
+}
+
+/// 16 bytes per row, with the address column.
+fn hexdump(data: &[u8], base: u32) {
+    for (row, chunk) in data.chunks(16).enumerate() {
+        let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+        let ascii: String = chunk
+            .iter()
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        println!(
+            "{:08x}  {:<47}  |{}|",
+            base + (row * 16) as u32,
+            hex.join(" "),
+            ascii
+        );
+    }
 }
 
 /// Prepare the loader: ota/loader.bin from cache or a fresh OTA download.

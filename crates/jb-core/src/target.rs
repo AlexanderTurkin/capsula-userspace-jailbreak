@@ -116,28 +116,38 @@ pub fn bring_up_amlogic(
     deadline: Option<Duration>,
     progress: &dyn Fn(Progress),
 ) -> Result<(AmlogicSession<rockusb::NusbTransport>, amlogic::SocId), TargetError> {
+    // The download window is ~1 s per power-up and closes regardless of
+    // identify, so the hot path must be lean: open directly on every
+    // poll (one bus enumeration per attempt, no presence pre-check) and
+    // treat "not found" as an empty bus.
     let start = Instant::now();
     let mut open_failures = 0u32;
     let mut seen = false;
     loop {
-        let on_bus = amlogic::present()?;
-        if on_bus != seen {
-            // every window opening/closing is logged: the wait must be
-            // diagnosable (the window is ~0.5 s per power-up)
-            log::info!("usb: 1b8e:c003 {}", if on_bus { "appeared" } else { "gone" });
-            seen = on_bus;
-        }
-        if on_bus {
-            match open_and_identify(progress) {
-                Ok(pair) => return Ok(pair),
-                Err(amlogic::Error::DeviceNotFound) => {} // window race
-                Err(e) => {
-                    open_failures += 1;
-                    if open_failures >= 10 {
-                        return Err(TargetError::AmlogicOpen(e.to_string()));
-                    }
-                    log::warn!("amlogic open/identify failed ({e}); retrying");
+        match open_and_identify(progress) {
+            Ok(pair) => return Ok(pair),
+            Err(amlogic::Error::DeviceNotFound) => {
+                if seen {
+                    log::info!("usb: 1b8e:c003 gone (+{}ms)", start.elapsed().as_millis());
+                    seen = false;
                 }
+            }
+            Err(e) => {
+                if !seen {
+                    log::info!(
+                        "usb: 1b8e:c003 appeared (+{}ms)",
+                        start.elapsed().as_millis()
+                    );
+                    seen = true;
+                }
+                open_failures += 1;
+                if open_failures >= 10 {
+                    return Err(TargetError::AmlogicOpen(e.to_string()));
+                }
+                log::warn!(
+                    "amlogic open/identify failed ({e}) (+{}ms); retrying",
+                    start.elapsed().as_millis()
+                );
             }
         }
         if let Some(d) = deadline {
@@ -152,8 +162,11 @@ pub fn bring_up_amlogic(
 fn open_and_identify(
     progress: &dyn Fn(Progress),
 ) -> amlogic::Result<(AmlogicSession<rockusb::NusbTransport>, amlogic::SocId)> {
+    let t = Instant::now();
     let mut s = AmlogicSession::open()?;
+    let opened = t.elapsed();
     let soc = s.identify()?;
+    log::info!("amlogic: open +{:?}, identify +{:?}", opened, t.elapsed());
     progress(Progress::Step(format!("amlogic download device: {soc}")));
     Ok((s, soc))
 }
