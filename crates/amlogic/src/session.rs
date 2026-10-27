@@ -56,6 +56,13 @@ impl<T: Transport> AmlogicSession<T> {
 }
 
 impl AmlogicSession<usbcore::NusbTransport> {
+    /// USB port reset (see [`usbcore::NusbTransport::reset`]): the
+    /// session handle dies, the device re-enumerates into a fresh
+    /// download window. Part of the automatic dump cycle.
+    pub fn reset(&self) -> Result<()> {
+        Ok(self.transport.reset()?)
+    }
+
     /// Open the first `1b8e:c003` device (either download stage) and
     /// claim interface 0.
     pub fn open() -> Result<Self> {
@@ -444,9 +451,26 @@ impl<T: Transport> AmlogicSession<T> {
         len: usize,
         progress: &dyn Fn(usize),
     ) -> Result<Vec<u8>> {
+        self.read_nand_range_until(off, len, progress, &|| false)
+    }
+
+    /// [`read_nand_range`] with a cooperative stop: `stop` is polled
+    /// before every sub-chunk, so a caller riding a short-lived window
+    /// can exit cleanly mid-range and finish the command it needs
+    /// before the window closes.
+    pub fn read_nand_range_until(
+        &mut self,
+        off: u32,
+        len: usize,
+        progress: &dyn Fn(usize),
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>> {
         let mut out = vec![0u8; len];
         let mut total = 0usize; // bytes received across all stages
         while total < len {
+            if stop() {
+                break;
+            }
             // identify doubles as the keepalive: one cheap control
             // transfer per stage
             let _ = self.identify();
@@ -470,6 +494,9 @@ impl<T: Transport> AmlogicSession<T> {
             }
             let mut staged = 0usize;
             while staged < stage {
+                if stop() {
+                    break;
+                }
                 let n = (stage - staged).min(UPLOAD_CHUNK);
                 let chunk = self.upload_read(crate::RAM_SCRATCH + staged as u32, n)?;
                 out[total + staged..total + staged + n].copy_from_slice(&chunk);
@@ -477,6 +504,9 @@ impl<T: Transport> AmlogicSession<T> {
                 progress(total + staged);
             }
             total += staged;
+            if staged < stage {
+                break; // stopped mid-stage
+            }
         }
         out.truncate(total);
         Ok(out)

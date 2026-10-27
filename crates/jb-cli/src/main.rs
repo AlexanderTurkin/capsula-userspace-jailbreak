@@ -402,8 +402,14 @@ fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
 
     loop {
         let t0 = std::time::Instant::now();
-        while st.done() < st.size && !st.short_read && t0.elapsed() < budget {
-            match jb_core::aml::dump_chunk(&mut s, &mut st, CHUNK, &progress) {
+        // the stop is polled between 32 KiB sub-chunks, so the session
+        // always exits with time to spare for the re-entry command
+        let stop = |t0: std::time::Instant| t0.elapsed() >= budget;
+        while st.done() < st.size && !st.short_read {
+            if stop(t0) {
+                break;
+            }
+            match jb_core::aml::dump_chunk_until(&mut s, &mut st, CHUNK, &progress, &|| stop(t0)) {
                 Ok(0) => break,
                 Ok(_) => {
                     if st.done() > last_done {
@@ -447,9 +453,14 @@ fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
         // session already died, this best-effort command is lost, the
         // board continues into Linux, and bring_up below simply waits
         // for the next power-up — power-cycle the speaker to resume.
-        jb_core::aml::reenter_download_window(&mut s);
+        jb_core::aml::reenter_download_window(&s);
         drop(s);
         let _ = jb_core::aml::write_dump(Path::new("backup"), part, &st.data, &|_| {});
+        println!(
+            "dumped {} so far; re-entering the download window \
+             (power-cycle the speaker if it has booted into Linux)...",
+            humansize(st.done() as u64)
+        );
         let (ns, _soc) = target::bring_up_amlogic(wait, &progress)?;
         s = ns;
     }

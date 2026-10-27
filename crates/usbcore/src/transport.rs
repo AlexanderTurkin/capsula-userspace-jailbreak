@@ -35,7 +35,6 @@ pub trait Transport {
 /// Transport over nusb (blocking IO via the MaybeFuture/EndpointRead/
 /// EndpointWrite adapters).
 pub struct NusbTransport {
-    #[allow(dead_code)] // kept for the interface lifetime
     device: nusb::Device,
     interface: nusb::Interface,
     /// bulk-IN endpoint (usually 0x81).
@@ -91,6 +90,13 @@ impl NusbTransport {
             ep_in,
             ep_out,
         })
+    }
+
+    /// USB port reset: the device re-enumerates (this handle dies), the
+    /// caller re-opens it. On the Amlogic gadget this re-attaches the
+    /// burning mode without a board reboot — the fast session cycle.
+    pub fn reset(&self) -> Result<()> {
+        Ok(self.device.reset().wait()?)
     }
 
     /// Bulk endpoint addresses of the active configuration, if any.

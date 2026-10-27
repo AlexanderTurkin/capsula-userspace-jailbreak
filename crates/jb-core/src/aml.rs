@@ -77,6 +77,20 @@ pub fn dump_chunk<T: usbcore::Transport>(
     max_bytes: usize,
     progress: ProgressFn,
 ) -> anyhow::Result<usize> {
+    dump_chunk_until(s, st, max_bytes, progress, &|| false)
+}
+
+/// [`dump_chunk`] with a cooperative stop (see
+/// [`amlogic::AmlogicSession::read_nand_range_until`]): the partial
+/// sub-range is kept in the state, and Ok(0) means "stopped, nothing
+/// new" — the caller re-enters the window and continues.
+pub fn dump_chunk_until<T: usbcore::Transport>(
+    s: &mut AmlogicSession<T>,
+    st: &mut DumpState,
+    max_bytes: usize,
+    progress: ProgressFn,
+    stop: &dyn Fn() -> bool,
+) -> anyhow::Result<usize> {
     let remaining = st.size - st.done();
     if remaining == 0 || st.short_read {
         return Ok(0);
@@ -85,13 +99,18 @@ pub fn dump_chunk<T: usbcore::Transport>(
     let base_done = st.done() as u64;
     let total = st.size as u64;
     let part = st.part.clone();
-    match s.read_nand_range(st.off + st.done() as u32, want, &|d| {
-        progress(Progress::PartitionProgress {
-            name: part.clone(),
-            done: base_done + d as u64,
-            total,
-        });
-    }) {
+    match s.read_nand_range_until(
+        st.off + st.done() as u32,
+        want,
+        &|d| {
+            progress(Progress::PartitionProgress {
+                name: part.clone(),
+                done: base_done + d as u64,
+                total,
+            });
+        },
+        stop,
+    ) {
         Ok(chunk) => {
             let short = chunk.len() < want;
             st.short_read = short;
@@ -106,15 +125,13 @@ pub fn dump_chunk<T: usbcore::Transport>(
     }
 }
 
-/// Re-enter the download mode by re-running the `try_auto_burn` env
-/// script: it invokes the u-boot `update` command, which re-initializes
-/// the whole burning gadget (fresh buffer manager, fresh timeouts —
-/// currently 600000/600000 after our saveenv) without rebooting the
-/// board. `reboot update` does not exist in this build (the board
-/// continues into Linux instead). Best effort: the gadget re-init drops
-/// the USB session; the caller waits for the device to re-appear.
-pub fn reenter_download_window<T: usbcore::Transport>(s: &mut AmlogicSession<T>) {
-    let _ = s.bulk_cmd("run try_auto_burn");
+/// Re-enter the download mode with a USB port reset. Verified on
+/// hardware: after the ~450 ms session death the board STAYS in the
+/// download mode (our 600 s env timers keep the gadget loop alive) with
+/// a dead USB stack — and a host-side port reset makes the gadget
+/// re-attach as a fresh device, no board interaction at all.
+pub fn reenter_download_window(s: &AmlogicSession<rockusb::NusbTransport>) {
+    let _ = s.reset();
 }
 
 /// Dump a vendor partition by name into `dir/<part>.bin`, through the
