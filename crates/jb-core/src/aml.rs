@@ -128,12 +128,17 @@ pub fn dump_chunk_until<T: usbcore::Transport>(
     }
 }
 
-/// Re-enter the download mode with a USB port reset. Verified on
-/// hardware: after the ~450 ms session death the board STAYS in the
-/// download mode (our 600 s env timers keep the gadget loop alive) with
-/// a dead USB stack — and a host-side port reset makes the gadget
-/// re-attach as a fresh device, no board interaction at all.
-pub fn reenter_download_window(s: &AmlogicSession<rockusb::NusbTransport>) {
+/// Re-enter the download mode: re-initialize the whole gadget with the
+/// `try_auto_burn` env script (fresh buffer manager and USB stack; the
+/// u-boot `update` command runs nested — its reply is lost as the
+/// gadget tears the pipes down), then a USB port reset to force the
+/// re-enumeration. A bare reset re-attaches a WEDGED gadget for only
+/// ~30 ms (verified on hardware) — the re-init is what actually
+/// revives it.
+pub fn reenter_download_window(s: &mut AmlogicSession<rockusb::NusbTransport>) {
+    let _ = s.bulk_cmd("run try_auto_burn");
+    // give the gadget a moment to tear down and re-init its stack
+    std::thread::sleep(std::time::Duration::from_millis(300));
     let _ = s.reset();
 }
 

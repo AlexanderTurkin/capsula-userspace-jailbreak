@@ -453,7 +453,7 @@ fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
         // session already died, this best-effort command is lost, the
         // board continues into Linux, and bring_up below simply waits
         // for the next power-up — power-cycle the speaker to resume.
-        jb_core::aml::reenter_download_window(&s);
+        jb_core::aml::reenter_download_window(&mut s);
         drop(s);
         let _ = jb_core::aml::write_dump(Path::new("backup"), part, &st.data, &|_| {});
         println!(
