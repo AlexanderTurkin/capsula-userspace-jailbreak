@@ -391,12 +391,11 @@ fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
     println!("entering the reboot-update download window...");
     jb_core::aml::reboot_into_update(&mut s);
     drop(s);
-    std::thread::sleep(Duration::from_secs(2));
     let (mut s, _soc) = target::bring_up_amlogic(wait, &progress)?;
 
-    // per-session budget: starts safe, grows x4 for every session that
+    // per-session budget: starts safe, grows for every session that
     // survives its budget; an immortal window ends up never rebooting
-    let mut budget = Duration::from_millis(250);
+    let mut budget = Duration::from_millis(400);
     let mut sessions_alive = 0u32;
     const CHUNK: usize = 256 * 1024;
 
@@ -422,7 +421,7 @@ fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
         if t0.elapsed() < budget {
             // died before the budget: the window is NOT deadline-free
             sessions_alive = 0;
-            budget = Duration::from_millis(250);
+            budget = Duration::from_millis(400);
         } else {
             sessions_alive += 1;
             if sessions_alive >= 2 {
@@ -430,10 +429,11 @@ fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
                 sessions_alive = 0;
             }
         }
-        // reboot back into the update window and continue
+        // checkpoint the partial dump, then reboot back into the update
+        // window and continue
+        let _ = jb_core::aml::write_dump(Path::new("backup"), part, &st.data, &|_| {});
         jb_core::aml::reboot_into_update(&mut s);
         drop(s);
-        std::thread::sleep(Duration::from_secs(2));
         let (ns, _soc) = target::bring_up_amlogic(wait, &progress)?;
         s = ns;
     }

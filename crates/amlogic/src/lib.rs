@@ -34,7 +34,8 @@ use nusb::MaybeFuture;
 pub use checksum::add_sum;
 pub use error::{Error, Result};
 pub use session::{
-    AmlogicSession, BULKCMD_MAX, BULK_REPLY_LEN, MEDIA_ACK_LEN, MEDIA_CHUNK, UPLOAD_CHUNK,
+    AmlogicSession, BULKCMD_MAX, BULK_REPLY_LEN, MEDIA_ACK_LEN, MEDIA_CHUNK, NAND_STAGE,
+    UPLOAD_CHUNK,
 };
 pub use soc::{SocId, Stage, STAGE_MINOR_IPL, STAGE_MINOR_SPL, STAGE_MINOR_TPL};
 

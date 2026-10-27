@@ -33,6 +33,11 @@ pub const BULKCMD_MAX: usize = 63;
 /// Per-transfer size of the AM_REQ_READ_MEDIA pipe: wValue is 16-bit
 /// and the buffer-manager slots are small — 32 KiB is a safe step.
 pub const UPLOAD_CHUNK: usize = 0x8000;
+/// NAND staging size of the raw-range dump: one `nand read` moves this
+/// much NAND->DRAM, then [`UPLOAD_CHUNK`] `upload mem` arms stream it
+/// to the host (fewer command round-trips per byte — the per-chunk
+/// cost is dominated by round-trips, not the bulk data).
+pub const NAND_STAGE: usize = 256 * 1024;
 /// Pause between `Continue:` status polls (as pyamlboot).
 const CONTINUE_PAUSE: Duration = Duration::from_secs(3);
 
@@ -426,6 +431,13 @@ impl<T: Transport> AmlogicSession<T> {
     /// `upload store` stream overruns the pipe on this gadget (the
     /// device pushes the whole armed size past the host read), so the
     /// per-chunk path is the reliable one.
+    /// Dump a raw NAND range through DRAM (flasher.sh
+    /// `read_big_from_flash`): a `nand read` stages up to
+    /// [`NAND_STAGE`] in RAM, `upload mem` streams it back in
+    /// [`UPLOAD_CHUNK`] steps. The one-shot `upload store` stream
+    /// overruns the pipe on this gadget (the device pushes the whole
+    /// armed size past the host read), so the per-chunk path is the
+    /// reliable one.
     pub fn read_nand_range(
         &mut self,
         off: u32,
@@ -433,32 +445,47 @@ impl<T: Transport> AmlogicSession<T> {
         progress: &dyn Fn(usize),
     ) -> Result<Vec<u8>> {
         let mut out = vec![0u8; len];
-        let mut done = 0usize;
-        while done < len {
-            // identify doubles as the keepalive: the vendor tool
-            // identifies before every operation and its sessions outlive
-            // the gadget's ~450 ms deadline — one cheap control transfer
-            // per chunk restarts it
+        let mut total = 0usize; // bytes received across all stages
+        'outer: while total < len {
+            // identify doubles as the keepalive: one cheap control
+            // transfer per stage
             let _ = self.identify();
-            let n = (len - done).min(UPLOAD_CHUNK);
-            if let Err(e) = self.nand_read(crate::RAM_SCRATCH, off + done as u32, n) {
-                if done == 0 {
+            let stage = (len - total).min(NAND_STAGE);
+            if let Err(e) = self.nand_read(crate::RAM_SCRATCH, off + total as u32, stage) {
+                if total == 0 {
                     return Err(e);
                 }
                 // a bad block fails the read after the good prefix — the
                 // received data is the truth (flasher.sh readable_size)
                 log::warn!(
-                    "nand read failed at {:#x} (+{done:#x} of {len:#x}): {e} — keeping the prefix",
-                    off + done as u32
+                    "nand read failed at {:#x} (+{total:#x} of {len:#x}): {e} — keeping the prefix",
+                    off + total as u32
                 );
-                out.truncate(done);
-                return Ok(out);
+                break;
             }
-            let chunk = self.upload_read(crate::RAM_SCRATCH, n)?;
-            out[done..done + n].copy_from_slice(&chunk);
-            done += n;
-            progress(done);
+            let mut staged = 0usize;
+            while staged < stage {
+                let n = (stage - staged).min(UPLOAD_CHUNK);
+                match self.upload_read(crate::RAM_SCRATCH + staged as u32, n) {
+                    Ok(chunk) => out[total + staged..total + staged + n].copy_from_slice(&chunk),
+                    Err(e) => {
+                        if total + staged == 0 {
+                            return Err(e);
+                        }
+                        log::warn!(
+                            "upload failed at {:#x} (+{total_staged:#x}): {e} — keeping the prefix",
+                            off + (total + staged) as u32,
+                            total_staged = total + staged
+                        );
+                        break 'outer;
+                    }
+                }
+                staged += n;
+                progress(total + staged);
+            }
+            total += staged;
         }
+        out.truncate(total);
         Ok(out)
     }
 

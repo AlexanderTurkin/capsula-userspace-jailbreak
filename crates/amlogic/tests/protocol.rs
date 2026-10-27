@@ -435,32 +435,30 @@ fn nand_read_command() {
     s.nand_read(0x0108_0000, 0x0b20_0000, 0x8000).unwrap();
 }
 
-/// read_nand_range: nand read -> upload mem per 32 KiB chunk.
+/// read_nand_range: one nand read per NAND_STAGE, then upload mem per
+/// 32 KiB sub-chunk.
 #[test]
 fn read_nand_range_steps() {
     let mut ok = vec![0u8; BULK_REPLY_LEN];
     ok[..7].copy_from_slice(b"success");
     let mut steps = vec![];
-    for (i, fill) in [0x11u8, 0x22].iter().enumerate() {
-        let off = 0x0b20_0000 + i * amlogic::UPLOAD_CHUNK;
-        // the loop identifies as its keepalive before every chunk
-        steps.push(Step::ControlIn(req::IDENTIFY_HOST, 0, 0, vec![0, 7, 1, 16]));
+    // one full stage streamed in UPLOAD_CHUNK sub-chunks
+    steps.push(Step::ControlIn(req::IDENTIFY_HOST, 0, 0, vec![0, 7, 1, 16]));
+    steps.push(Step::ControlOut(
+        req::BULKCMD,
+        0,
+        2,
+        format!("nand read 0x1080000 0xb200000 {:#x}\0", amlogic::NAND_STAGE).into_bytes(),
+    ));
+    steps.push(Step::BulkIn(ok.clone()));
+    let subs = amlogic::NAND_STAGE / amlogic::UPLOAD_CHUNK;
+    for i in 0..subs {
+        let addr = 0x0108_0000 + i * amlogic::UPLOAD_CHUNK;
         steps.push(Step::ControlOut(
             req::BULKCMD,
             0,
             2,
-            format!(
-                "nand read 0x1080000 {off:#x} {:#x}\0",
-                amlogic::UPLOAD_CHUNK
-            )
-            .into_bytes(),
-        ));
-        steps.push(Step::BulkIn(ok.clone()));
-        steps.push(Step::ControlOut(
-            req::BULKCMD,
-            0,
-            2,
-            format!("upload mem 0x1080000 normal {:#x}\0", amlogic::UPLOAD_CHUNK).into_bytes(),
+            format!("upload mem {addr:#x} normal {:#x}\0", amlogic::UPLOAD_CHUNK).into_bytes(),
         ));
         steps.push(Step::BulkIn(ok.clone()));
         steps.push(Step::ControlIn(
@@ -469,13 +467,14 @@ fn read_nand_range_steps() {
             (amlogic::UPLOAD_CHUNK / 0x1000) as u16,
             vec![0u8; 16],
         ));
-        steps.push(Step::BulkIn(vec![*fill; amlogic::UPLOAD_CHUNK]));
+        steps.push(Step::BulkIn(vec![(i % 8) as u8; amlogic::UPLOAD_CHUNK]));
     }
     let mut s = session(steps);
     let data = s
-        .read_nand_range(0x0b20_0000, 2 * amlogic::UPLOAD_CHUNK, &|_| {})
+        .read_nand_range(0x0b20_0000, amlogic::NAND_STAGE, &|_| {})
         .unwrap();
-    assert_eq!(data.len(), 2 * amlogic::UPLOAD_CHUNK);
-    assert_eq!(data[0], 0x11);
-    assert_eq!(data[amlogic::UPLOAD_CHUNK], 0x22);
+    assert_eq!(data.len(), amlogic::NAND_STAGE);
+    assert_eq!(data[0], 0);
+    assert_eq!(data[amlogic::UPLOAD_CHUNK], 1);
+    assert_eq!(data[7 * amlogic::UPLOAD_CHUNK], 7);
 }
