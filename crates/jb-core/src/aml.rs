@@ -112,7 +112,10 @@ pub fn dump_chunk_until<T: usbcore::Transport>(
         stop,
     ) {
         Ok(chunk) => {
-            let short = chunk.len() < want;
+            // a short chunk is a bad block ONLY when the range reader
+            // ran to completion; the cooperative stop also returns a
+            // partial chunk, and that is just the cycle boundary
+            let short = chunk.len() < want && !stop();
             st.short_read = short;
             st.data.extend_from_slice(&chunk);
             Ok(chunk.len())
