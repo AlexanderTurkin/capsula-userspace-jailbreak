@@ -36,30 +36,33 @@ pub fn capture_env<T: usbcore::Transport>(s: &mut AmlogicSession<T>) -> anyhow::
     Ok(text.to_string())
 }
 
-/// Dump a vendor partition by name into `dir/<part>.bin`. A short read
-/// (bad blocks) is kept, matching the flasher: the received length is
-/// the truth. Returns the number of bytes written.
+/// Dump a vendor partition by name into `dir/<part>.bin`, through the
+/// raw NAND offsets (nand read -> DRAM -> upload mem; flasher.sh
+/// `read_big_from_flash`). A `nand read` across a bad block fails after
+/// the good prefix — the received prefix is kept, matching the flasher:
+/// the received length is the truth. Returns the number of bytes
+/// written.
 pub fn dump_partition<T: usbcore::Transport>(
     s: &mut AmlogicSession<T>,
     part: &str,
     dir: &Path,
     progress: ProgressFn,
 ) -> anyhow::Result<u64> {
-    let (_, _, size) = amlogic::partition(part)
+    let (_, off, size) = amlogic::partition(part)
         .ok_or_else(|| anyhow::anyhow!("unknown partition {part:?}; known: {}", known_parts()))?;
     progress(Progress::PartitionStart {
         name: part.into(),
         sectors: size as u64 / 512,
     });
     let data = s
-        .upload_store(part, size as usize, &|done| {
+        .read_nand_range(off, size as usize, &|done| {
             progress(Progress::PartitionProgress {
                 name: part.into(),
                 done: done as u64,
                 total: size as u64,
             });
         })
-        .map_err(|e| anyhow::anyhow!("upload store {part}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("dump {part} at {off:#x}: {e}"))?;
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{part}.bin"));
     let mut f = std::fs::File::create(&path)?;

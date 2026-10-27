@@ -408,6 +408,43 @@ impl<T: Transport> AmlogicSession<T> {
             .map(|_| ())
     }
 
+    /// Dump a raw NAND range through DRAM in [`UPLOAD_CHUNK`] steps
+    /// (flasher.sh `read_big_from_flash`): `nand read` stages a chunk in
+    /// RAM, `upload mem` streams it to the host. The one-shot
+    /// `upload store` stream overruns the pipe on this gadget (the
+    /// device pushes the whole armed size past the host read), so the
+    /// per-chunk path is the reliable one.
+    pub fn read_nand_range(
+        &mut self,
+        off: u32,
+        len: usize,
+        progress: &dyn Fn(usize),
+    ) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; len];
+        let mut done = 0usize;
+        while done < len {
+            let n = (len - done).min(UPLOAD_CHUNK);
+            if let Err(e) = self.nand_read(crate::RAM_SCRATCH, off + done as u32, n) {
+                if done == 0 {
+                    return Err(e);
+                }
+                // a bad block fails the read after the good prefix — the
+                // received data is the truth (flasher.sh readable_size)
+                log::warn!(
+                    "nand read failed at {:#x} (+{done:#x} of {len:#x}): {e} — keeping the prefix",
+                    off + done as u32
+                );
+                out.truncate(done);
+                return Ok(out);
+            }
+            let chunk = self.upload_read(crate::RAM_SCRATCH, n)?;
+            out[done..done + n].copy_from_slice(&chunk);
+            done += n;
+            progress(done);
+        }
+        Ok(out)
+    }
+
     /// Stream a whole partition by name: one `upload store <part>
     /// normal <total>` arm, then sequential AM_REQ_UPLOAD fetches until
     /// the device reports no data left. A short stream (bad blocks
