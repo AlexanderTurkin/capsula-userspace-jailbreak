@@ -387,15 +387,11 @@ fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
         sectors: st.size as u64 / 512,
     });
 
-    // jump from the deadlined cold-boot window into the update window
-    println!("entering the reboot-update download window...");
-    jb_core::aml::reboot_into_update(&mut s);
-    drop(s);
-    let (mut s, _soc) = target::bring_up_amlogic(wait, &progress)?;
-
-    // per-session budget: starts safe, grows for every session that
-    // survives its budget; an immortal window ends up never rebooting
-    let mut budget = Duration::from_millis(400);
+    // per-session budget: starts SAFE (300 ms) so the re-entry command
+    // below always goes out before the ~450-500 ms reaper, and grows
+    // for every session that survives its budget — an immortal window
+    // ends up never re-entering
+    let mut budget = Duration::from_millis(300);
     let mut sessions_alive = 0u32;
     // the same-offset failure budget: a persistent failure (not a mere
     // session death) after several reconnect attempts stops the dump
@@ -429,7 +425,7 @@ fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
         if t0.elapsed() < budget {
             // died before the budget: the window is NOT deadline-free
             sessions_alive = 0;
-            budget = Duration::from_millis(400);
+            budget = Duration::from_millis(300);
         } else {
             sessions_alive += 1;
             if sessions_alive >= 2 {
@@ -445,11 +441,15 @@ fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
                 st.done()
             );
         }
-        // checkpoint the partial dump, then reboot back into the update
-        // window and continue
-        let _ = jb_core::aml::write_dump(Path::new("backup"), part, &st.data, &|_| {});
-        jb_core::aml::reboot_into_update(&mut s);
+        // re-enter the download window FIRST (the session may be on the
+        // edge of the reaper), then checkpoint: the file write is
+        // host-side and can happen after the device is gone. If the
+        // session already died, this best-effort command is lost, the
+        // board continues into Linux, and bring_up below simply waits
+        // for the next power-up — power-cycle the speaker to resume.
+        jb_core::aml::reenter_download_window(&mut s);
         drop(s);
+        let _ = jb_core::aml::write_dump(Path::new("backup"), part, &st.data, &|_| {});
         let (ns, _soc) = target::bring_up_amlogic(wait, &progress)?;
         s = ns;
     }

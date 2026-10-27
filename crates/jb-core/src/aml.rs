@@ -106,15 +106,15 @@ pub fn dump_chunk<T: usbcore::Transport>(
     }
 }
 
-/// Re-enter the download mode via `reboot update`: the cold-boot window
-/// (`try_auto_burn=update 700 450`) carries both timeouts, while the
-/// reboot-update path runs `usb_burning=update 1000` whose single
-/// argument makes do_v2_usbtool DELETE identifyWaitTime — no auto-burn
-/// deadline is armed, and the 1 s connect timeout is cancelled by the
-/// host's SetConfiguration during enumeration. Best effort: the device
-/// disconnects while rebooting.
-pub fn reboot_into_update<T: usbcore::Transport>(s: &mut AmlogicSession<T>) {
-    let _ = s.bulk_cmd("reboot update");
+/// Re-enter the download mode by re-running the `try_auto_burn` env
+/// script: it invokes the u-boot `update` command, which re-initializes
+/// the whole burning gadget (fresh buffer manager, fresh timeouts —
+/// currently 600000/600000 after our saveenv) without rebooting the
+/// board. `reboot update` does not exist in this build (the board
+/// continues into Linux instead). Best effort: the gadget re-init drops
+/// the USB session; the caller waits for the device to re-appear.
+pub fn reenter_download_window<T: usbcore::Transport>(s: &mut AmlogicSession<T>) {
+    let _ = s.bulk_cmd("run try_auto_burn");
 }
 
 /// Dump a vendor partition by name into `dir/<part>.bin`, through the
