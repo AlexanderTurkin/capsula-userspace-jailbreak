@@ -425,12 +425,6 @@ impl<T: Transport> AmlogicSession<T> {
             .map(|_| ())
     }
 
-    /// Dump a raw NAND range through DRAM in [`UPLOAD_CHUNK`] steps
-    /// (flasher.sh `read_big_from_flash`): `nand read` stages a chunk in
-    /// RAM, `upload mem` streams it to the host. The one-shot
-    /// `upload store` stream overruns the pipe on this gadget (the
-    /// device pushes the whole armed size past the host read), so the
-    /// per-chunk path is the reliable one.
     /// Dump a raw NAND range through DRAM (flasher.sh
     /// `read_big_from_flash`): a `nand read` stages up to
     /// [`NAND_STAGE`] in RAM, `upload mem` streams it back in
@@ -438,6 +432,12 @@ impl<T: Transport> AmlogicSession<T> {
     /// overruns the pipe on this gadget (the device pushes the whole
     /// armed size past the host read), so the per-chunk path is the
     /// reliable one.
+    ///
+    /// Error split: a `nand read` REJECTED by the device (`failed:`,
+    /// a bad block after the good prefix) truncates the result and
+    /// returns it; a TRANSPORT error is the session dying and
+    /// propagates to the caller, which reconnects and retries the same
+    /// range.
     pub fn read_nand_range(
         &mut self,
         off: u32,
@@ -446,40 +446,33 @@ impl<T: Transport> AmlogicSession<T> {
     ) -> Result<Vec<u8>> {
         let mut out = vec![0u8; len];
         let mut total = 0usize; // bytes received across all stages
-        'outer: while total < len {
+        while total < len {
             // identify doubles as the keepalive: one cheap control
             // transfer per stage
             let _ = self.identify();
             let stage = (len - total).min(NAND_STAGE);
             if let Err(e) = self.nand_read(crate::RAM_SCRATCH, off + total as u32, stage) {
-                if total == 0 {
-                    return Err(e);
+                match e {
+                    // the device rejected the read after the good
+                    // prefix — the received data is the truth
+                    // (flasher.sh readable_size)
+                    Error::CommandFailed(_) if total > 0 => {
+                        log::warn!(
+                            "nand read rejected at {:#x} (+{total:#x} of {len:#x}): {e} \
+                             — keeping the prefix",
+                            off + total as u32
+                        );
+                        break;
+                    }
+                    // anything else is the session dying
+                    other => return Err(other),
                 }
-                // a bad block fails the read after the good prefix — the
-                // received data is the truth (flasher.sh readable_size)
-                log::warn!(
-                    "nand read failed at {:#x} (+{total:#x} of {len:#x}): {e} — keeping the prefix",
-                    off + total as u32
-                );
-                break;
             }
             let mut staged = 0usize;
             while staged < stage {
                 let n = (stage - staged).min(UPLOAD_CHUNK);
-                match self.upload_read(crate::RAM_SCRATCH + staged as u32, n) {
-                    Ok(chunk) => out[total + staged..total + staged + n].copy_from_slice(&chunk),
-                    Err(e) => {
-                        if total + staged == 0 {
-                            return Err(e);
-                        }
-                        log::warn!(
-                            "upload failed at {:#x} (+{total_staged:#x}): {e} — keeping the prefix",
-                            off + (total + staged) as u32,
-                            total_staged = total + staged
-                        );
-                        break 'outer;
-                    }
-                }
+                let chunk = self.upload_read(crate::RAM_SCRATCH + staged as u32, n)?;
+                out[total + staged..total + staged + n].copy_from_slice(&chunk);
                 staged += n;
                 progress(total + staged);
             }

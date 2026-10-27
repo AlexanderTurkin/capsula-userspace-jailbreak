@@ -397,20 +397,28 @@ fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
     // survives its budget; an immortal window ends up never rebooting
     let mut budget = Duration::from_millis(400);
     let mut sessions_alive = 0u32;
+    // the same-offset failure budget: a persistent failure (not a mere
+    // session death) after several reconnect attempts stops the dump
+    let mut failures_at_offset = 0u32;
+    let mut last_done = st.done();
     const CHUNK: usize = 256 * 1024;
+    const MAX_OFFSET_FAILURES: u32 = 5;
 
     loop {
         let t0 = std::time::Instant::now();
-        let mut got_any = false;
         while st.done() < st.size && !st.short_read && t0.elapsed() < budget {
             match jb_core::aml::dump_chunk(&mut s, &mut st, CHUNK, &progress) {
                 Ok(0) => break,
-                Ok(_) => got_any = true,
-                Err(e) => {
-                    if got_any || st.done() == 0 && sessions_alive == 0 {
-                        // mid-chunk transport death — session over
-                        log::warn!("session died: {e}");
+                Ok(_) => {
+                    if st.done() > last_done {
+                        last_done = st.done();
+                        failures_at_offset = 0;
                     }
+                }
+                Err(e) => {
+                    // session death mid-chunk: reconnect and retry the
+                    // same range (DumpState did not advance)
+                    log::warn!("session died: {e}");
                     break;
                 }
             }
@@ -428,6 +436,14 @@ fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
                 budget = budget.saturating_mul(8);
                 sessions_alive = 0;
             }
+        }
+        failures_at_offset += 1;
+        if failures_at_offset > MAX_OFFSET_FAILURES {
+            bail!(
+                "dump stuck at +{:#x} after {MAX_OFFSET_FAILURES} reconnect attempts: \
+                 power-cycle the speaker and re-run to resume from the checkpoint",
+                st.done()
+            );
         }
         // checkpoint the partial dump, then reboot back into the update
         // window and continue
