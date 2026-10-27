@@ -76,6 +76,14 @@ enum Command {
         #[arg(allow_hyphen_values = true)]
         cmds: Vec<String>,
     },
+    /// Amlogic mini: capture the u-boot environment over USB (read-only)
+    AmlEnv,
+    /// Amlogic mini: dump a vendor partition by name into backup/ (read-only)
+    AmlDump {
+        /// Partition name (bootloader, tpl, misc, boot_a, boot_b,
+        /// system_a, system_b, data)
+        part: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -91,6 +99,8 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Backup) => run_backup(wait),
         Some(Command::Monitor) => monitor(),
         Some(Command::Aml { cmds }) => run_amlogic(wait, &cmds),
+        Some(Command::AmlEnv) => run_aml_env(wait),
+        Some(Command::AmlDump { part }) => run_aml_dump(wait, &part),
     }
 }
 
@@ -319,6 +329,39 @@ fn parse_upload_cmd(c: &str) -> Option<(u32, usize)> {
         return None;
     }
     Some((addr, size))
+}
+
+/// `capsula-jb aml-env`: print the u-boot environment, captured over USB
+/// (export to DRAM + read back — answers of bulkcmd go to the UART).
+fn run_aml_env(wait: Option<Duration>) -> anyhow::Result<()> {
+    println!(
+        "Connect the Amlogic mini and power it on: the u-boot download \
+         window is ~0.5 s at every boot; power-cycle to retry."
+    );
+    let p = progress::CliProgress::new();
+    let progress = |ev: Progress| p.handle(ev);
+    let (mut s, _soc) = target::bring_up_amlogic(wait, &progress)?;
+    let env = jb_core::aml::capture_env(&mut s)?;
+    println!("{env}");
+    Ok(())
+}
+
+/// `capsula-jb aml-dump <part>`: stream a vendor partition into backup/.
+fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
+    println!(
+        "Connect the Amlogic mini and power it on: the u-boot download \
+         window is ~0.5 s at every boot; power-cycle to retry."
+    );
+    let p = progress::CliProgress::new();
+    let progress = |ev: Progress| p.handle(ev);
+    let (mut s, _soc) = target::bring_up_amlogic(wait, &progress)?;
+    let out = Path::new("backup");
+    let got = jb_core::aml::dump_partition(&mut s, part, out, &progress)?;
+    println!(
+        "done: backup/{part}.bin, {} (nothing was written to the device)",
+        humansize(got)
+    );
+    Ok(())
 }
 
 /// 16 bytes per row, with the address column.

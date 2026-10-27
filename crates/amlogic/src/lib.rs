@@ -33,13 +33,43 @@ use nusb::MaybeFuture;
 
 pub use checksum::add_sum;
 pub use error::{Error, Result};
-pub use session::{AmlogicSession, BULK_REPLY_LEN, MEDIA_ACK_LEN, MEDIA_CHUNK};
+pub use session::{
+    AmlogicSession, BULKCMD_MAX, BULK_REPLY_LEN, MEDIA_ACK_LEN, MEDIA_CHUNK, UPLOAD_CHUNK,
+};
 pub use soc::{SocId, Stage, STAGE_MINOR_IPL, STAGE_MINOR_SPL, STAGE_MINOR_TPL};
 
 /// USB VID of all Amlogic download modes.
 pub const USB_VID_AMLOGIC: u16 = 0x1b8e;
 /// Download-mode PID (BootROM and the u-boot burning gadget alike).
 pub const USB_PID_UPDATE: u16 = 0xc003;
+
+/// DRAM scratch addresses of the vendor flasher (flasher.sh): the
+/// kernel-load address doubles as the NAND staging buffer.
+pub const RAM_SCRATCH: u32 = 0x0108_0000;
+/// Where `env export -t` writes the environment text.
+pub const ENV_ADDR: u32 = 0x0200_0000;
+/// Size reserved for the env text.
+pub const ENV_SIZE: usize = 0x1_0000;
+
+/// Vendor partition map of the Capsula Mini NAND (256 MiB, flasher.sh
+/// VPART_*): name -> (offset, size). The AML reserved areas (bbt, env,
+/// keys, dtb, ddr at 0x280000..0x5c0000) are deliberately not listed:
+/// they are device-unique and must not be reflashed from a dump.
+pub const PARTITIONS: &[(&str, u32, u32)] = &[
+    ("bootloader", 0x0000_0000, 0x0020_0000),
+    ("tpl", 0x0080_0000, 0x0080_0000),
+    ("misc", 0x0100_0000, 0x0020_0000),
+    ("boot_a", 0x0120_0000, 0x0100_0000),
+    ("boot_b", 0x0220_0000, 0x0100_0000),
+    ("system_a", 0x0320_0000, 0x0400_0000),
+    ("system_b", 0x0720_0000, 0x0400_0000),
+    ("data", 0x0b20_0000, 0x04e0_0000),
+];
+
+/// Look up a partition in [`PARTITIONS`].
+pub fn partition(name: &str) -> Option<(&'static str, u32, u32)> {
+    PARTITIONS.iter().find(|(n, _, _)| *n == name).copied()
+}
 
 /// Whether an Amlogic download-mode device is on the bus right now
 /// (enumeration only, the device is not opened).

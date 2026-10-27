@@ -166,7 +166,10 @@ fn open_and_identify(
     let mut s = AmlogicSession::open()?;
     let opened = t.elapsed();
     let soc = s.identify()?;
-    log::info!("amlogic: open +{:?}, identify +{:?}", opened, t.elapsed());
+    // The first bulkcmd of a session can lose its leading bytes
+    // (flasher.sh prime_bulk): sacrifice a command nobody needs.
+    s.prime();
+    log::info!("amlogic: open +{opened:?}, identify +{:?}", t.elapsed());
     progress(Progress::Step(format!("amlogic download device: {soc}")));
     Ok((s, soc))
 }

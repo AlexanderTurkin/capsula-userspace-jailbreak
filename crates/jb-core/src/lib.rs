@@ -5,6 +5,7 @@
 //! rewritable; no other partition is touched. The configuration lives
 //! in resources/config.toml (embedded into the binary).
 
+pub mod aml;
 pub mod backup;
 pub mod backup_store;
 pub mod config;

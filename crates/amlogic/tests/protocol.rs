@@ -306,3 +306,129 @@ fn fill_memory_wire_format() {
     })]);
     s.fill_memory(&[(0xffd00000, 0x1234)]).unwrap();
 }
+
+/// The bulkcmd payload is capped at 63 chars + NUL: the device truncates
+/// at 64 silently (flasher.sh BULKCMD_MAX).
+#[test]
+fn bulk_cmd_payload_cap() {
+    let mut s = session(vec![Step::ControlOut(req::BULKCMD, 0, 2, {
+        let mut v = vec![b'x'; 63];
+        v.push(0);
+        v
+    })]);
+    // 63 chars + NUL = exactly 64 bytes: fits, and reaches the bus
+    assert!(s.send_bulk_cmd(&"x".repeat(63)).is_ok());
+    assert_eq!(s.transport().pos, 1);
+    // 64 chars would be truncated by the device: refused before the bus
+    let err = s.send_bulk_cmd(&"x".repeat(64)).unwrap_err();
+    assert!(err.to_string().contains("command too long"));
+    assert_eq!(s.transport().pos, 1);
+}
+
+/// upload_store: one arm, then sequential AM_REQ_UPLOAD fetches until the
+/// head reports no data left; a short stream (bad blocks) is kept.
+#[test]
+fn upload_store_stream() {
+    fn head(left: u32, seq: u32) -> Vec<u8> {
+        let mut h = vec![0u8; 16];
+        h[4..8].copy_from_slice(&left.to_le_bytes());
+        h[8..12].copy_from_slice(&seq.to_le_bytes());
+        h
+    }
+    fn ok() -> Vec<u8> {
+        let mut r = vec![0u8; BULK_REPLY_LEN];
+        r[..7].copy_from_slice(b"success");
+        r
+    }
+    // total 0x15000: fetch 0xffff then 0x5001
+    let mut steps = vec![
+        Step::ControlOut(
+            req::BULKCMD,
+            0,
+            2,
+            b"upload store data normal 0x15000\0".to_vec(),
+        ),
+        Step::BulkIn(ok()),
+        Step::ControlIn(req::READ_MEDIA, 0xffff, 16, head(0x5001, 0)),
+        Step::BulkIn(vec![0xa5; 0xffff]),
+        Step::ControlIn(req::READ_MEDIA, 0x5001, 6, head(0, 1)),
+        Step::BulkIn(vec![0x5a; 0x5001]),
+    ];
+    let _ = &mut steps;
+    let mut s = session(steps);
+    let data = s.upload_store("data", 0x15000, &|_| {}).unwrap();
+    assert_eq!(data.len(), 0x15000);
+    assert_eq!(&data[..4], &[0xa5; 4][..]);
+    assert_eq!(&data[0xffff..0xffff + 4], &[0x5a; 4][..]);
+}
+
+/// upload_store keeps a short stream when the device reports no data
+/// left early (bad blocks shorten NAND reads).
+#[test]
+fn upload_store_short_read_kept() {
+    let mut h = vec![0u8; 16]; // left = 0
+    let mut ok = vec![0u8; BULK_REPLY_LEN];
+    ok[..7].copy_from_slice(b"success");
+    let mut s = session(vec![
+        Step::ControlOut(
+            req::BULKCMD,
+            0,
+            2,
+            b"upload store data normal 0x20000\0".to_vec(),
+        ),
+        Step::BulkIn(ok),
+        Step::ControlIn(req::READ_MEDIA, 0xffff, 16, std::mem::take(&mut h)),
+        Step::BulkIn(vec![0x33; 0xffff]),
+    ]);
+    let data = s.upload_store("data", 0x20000, &|_| {}).unwrap();
+    assert_eq!(data.len(), 0xffff); // short, but kept
+}
+
+/// read_dram chunks the range into independent upload-mem arms.
+#[test]
+fn read_dram_chunks() {
+    let mut ok = vec![0u8; BULK_REPLY_LEN];
+    ok[..7].copy_from_slice(b"success");
+    let mut steps = vec![];
+    let chunks = [
+        (amlogic::ENV_ADDR, 0x8000usize, 0x11u8),
+        (amlogic::ENV_ADDR + 0x8000, 0x8000, 0x22),
+    ];
+    for (addr, size, fill) in chunks {
+        steps.push(Step::ControlOut(
+            req::BULKCMD,
+            0,
+            2,
+            format!("upload mem {addr:#x} normal {size:#x}\0").into_bytes(),
+        ));
+        steps.push(Step::BulkIn(ok.clone()));
+        steps.push(Step::ControlIn(
+            req::READ_MEDIA,
+            size as u16,
+            (size / 0x1000) as u16,
+            vec![0u8; 16],
+        ));
+        steps.push(Step::BulkIn(vec![fill; size]));
+    }
+    let mut s = session(steps);
+    let data = s.read_dram(amlogic::ENV_ADDR, 0x10000, &|_| {}).unwrap();
+    assert_eq!(&data[..4], &[0x11; 4][..]);
+    assert_eq!(&data[0x8000..0x8004], &[0x22; 4][..]);
+}
+
+/// nand_read builds the flasher's raw-offset read command.
+#[test]
+fn nand_read_command() {
+    let mut ok = vec![0u8; BULK_REPLY_LEN];
+    ok[..7].copy_from_slice(b"success");
+    let mut s = session(vec![
+        Step::ControlOut(
+            req::BULKCMD,
+            0,
+            2,
+            b"nand read 0x1080000 0xb200000 0x8000\0".to_vec(),
+        ),
+        Step::BulkIn(ok),
+    ]);
+    s.nand_read(0x0108_0000, 0x0b20_0000, 0x8000).unwrap();
+}
