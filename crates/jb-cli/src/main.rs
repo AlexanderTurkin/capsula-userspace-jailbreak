@@ -288,6 +288,14 @@ fn run_amlogic(wait: Option<Duration>, cmds: &[String]) -> anyhow::Result<()> {
     }
     let t0 = std::time::Instant::now();
     for c in cmds {
+        // "sleep <ms>": host-side pause, nothing is sent — for testing
+        // whether the session dies on a deadline or on a resource leak
+        if let Some(ms) = c.strip_prefix("sleep ") {
+            let ms: u64 = ms.parse().context("sleep <ms>: bad number")?;
+            println!("sleeping {ms}ms (nothing is sent)...");
+            std::thread::sleep(Duration::from_millis(ms));
+            continue;
+        }
         let r = if let Some((addr, size)) = parse_upload_cmd(c) {
             println!("uploading {size:#x} bytes from {addr:#x}...");
             s.upload_read(addr, size).map(|data| {

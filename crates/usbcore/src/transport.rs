@@ -65,25 +65,40 @@ impl NusbTransport {
     /// Open an exact DeviceInfo (to pick a specific instance).
     pub fn open_device_info(info: &nusb::DeviceInfo) -> Result<Self> {
         let device = info.open().wait()?;
-        // Explicitly SET CONFIGURATION(1). Linux does it during
-        // enumeration; macOS does not — and download-mode gadgets rely
-        // on it to cancel their "wait for PC" timeout (the Amlogic
-        // u-boot burning gadget exits ~700 ms after start unless it
-        // sees SetConfig, killing the session mid-transfer).
-        if let Err(e) = device.set_configuration(1).wait() {
-            // already-configured devices reject this; anything else is
-            // still worth a try before claiming
-            log::debug!("set_configuration(1): {e} (continuing)");
+        // The endpoints are read from the ACTIVE configuration; if the
+        // OS left the device unconfigured (rare — macOS/Linux configure
+        // during enumeration), do it explicitly: download-mode gadgets
+        // like the Amlogic burning one cancel their "wait for PC"
+        // timeout only on SetConfig. A redundant SetConfig would reset
+        // the port and kill such a gadget, so it is strictly a fallback.
+        if Self::find_bulk_endpoints(&device)?.is_none() {
+            log::info!("usb: device is unconfigured — setting configuration 1");
+            device
+                .set_configuration(1)
+                .wait()
+                .map_err(|e| Error::Usb(format!("set_configuration(1): {e}")))?;
         }
         let interface = match device.claim_interface(0).wait() {
             Ok(i) => i,
             Err(_) => device.detach_and_claim_interface(0).wait()?,
         };
+        let (ep_in, ep_out) = Self::find_bulk_endpoints(&device)?
+            .ok_or_else(|| Error::Usb("device has no bulk endpoints".into()))?;
 
-        // Find the bulk IN/OUT endpoints in the active configuration
-        let config = device
-            .active_configuration()
-            .map_err(|e| Error::Usb(e.to_string()))?;
+        Ok(NusbTransport {
+            device,
+            interface,
+            ep_in,
+            ep_out,
+        })
+    }
+
+    /// Bulk endpoint addresses of the active configuration, if any.
+    fn find_bulk_endpoints(device: &nusb::Device) -> Result<Option<(u8, u8)>> {
+        let config = match device.active_configuration() {
+            Ok(c) => c,
+            Err(_) => return Ok(None),
+        };
         let mut ep_in = None;
         let mut ep_out = None;
         'outer: for iface in config.interfaces() {
@@ -102,16 +117,9 @@ impl NusbTransport {
                 }
             }
         }
-        let (ep_in, ep_out) = (ep_in, ep_out);
-        let (Some(ep_in), Some(ep_out)) = (ep_in, ep_out) else {
-            return Err(Error::Usb("device has no bulk endpoints".into()));
-        };
-
-        Ok(NusbTransport {
-            device,
-            interface,
-            ep_in,
-            ep_out,
+        Ok(match (ep_in, ep_out) {
+            (Some(i), Some(o)) => Some((i, o)),
+            _ => None,
         })
     }
 }
