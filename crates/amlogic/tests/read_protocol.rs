@@ -428,10 +428,10 @@ fn nand_range_keeps_a_full_stage_after_a_bad_block_status() {
     assert_eq!(s.transport().pos, s.transport().steps.len());
 }
 
-/// A failed status with an untouched sentinel tail is an actual short
-/// read: keep the prefix, not the 0xa5 padding.
+/// A suffix equal to the staging sentinel can also be real NAND data.
+/// A failed status provides no trustworthy byte count for trimming it.
 #[test]
-fn nand_range_truncates_a_failed_stage_at_the_sentinel_tail() {
+fn nand_range_keeps_a_long_sentinel_suffix_after_failed_status() {
     let mut steps = armed("echo; mw.b 0x1080000 0xa5 0x200");
     steps.push(Step::ControlOut(
         req::BULKCMD,
@@ -445,11 +445,11 @@ fn nand_range_truncates_a_failed_stage_at_the_sentinel_tail() {
     payload.extend(vec![0xa5; 0x100]);
     steps.extend([
         Step::ControlIn(req::READ_MEDIA, 4096, 1, head(0x200)),
-        Step::BulkIn(payload),
+        Step::BulkIn(payload.clone()),
     ]);
     let mut s = session(steps);
     let data = s.read_nand_range(0, 0x200, &|_| {}).unwrap();
-    assert_eq!(data, vec![0x42; 0x100]);
+    assert_eq!(data, payload);
 }
 
 /// A failed status with no data in the buffer is a real failure, even
@@ -493,4 +493,31 @@ fn tpl_command_over_63_chars_is_refused_before_usb() {
     let mut s = session(vec![]);
     assert!(s.tpl_cmd(&"x".repeat(64)).is_err());
     assert_eq!(s.transport().pos, 0);
+}
+
+#[test]
+fn nand_range_preserves_a_real_final_a5_byte_after_failed_status() {
+    let mut steps = armed("echo; mw.b 0x1080000 0xa5 0x4");
+    steps.extend([
+        Step::ControlOut(
+            req::BULKCMD,
+            0,
+            2,
+            command("echo; nand read 0x1080000 0x0 0x4"),
+        ),
+        Step::BulkIn(b"failed:\0".to_vec()),
+    ]);
+    steps.extend(armed("upload mem 0x1080000 normal 0x4"));
+    steps.extend([
+        Step::ControlIn(req::READ_MEDIA, 4096, 1, head(4)),
+        Step::BulkIn(vec![1, 2, 3, 0xa5]),
+    ]);
+    let mut s = session(steps);
+    let progress = RefCell::new(Vec::new());
+    let data = s
+        .read_nand_range(0, 4, &|done| progress.borrow_mut().push(done))
+        .unwrap();
+    assert_eq!(data, [1, 2, 3, 0xa5]);
+    assert_eq!(*progress.borrow(), [4]);
+    assert_eq!(s.transport().pos, s.transport().steps.len());
 }

@@ -732,8 +732,11 @@ impl<T: Transport> AmlogicSession<T> {
     /// a bad block after the good prefix) does NOT necessarily mean the
     /// staging buffer was not written: the live A113X gadget fills the
     /// whole range and still answers `failed:` when it skipped a bad
-    /// block. The stage is uploaded in both cases and the sentinel tail
-    /// decides how much is real. A TRANSPORT error is the session dying
+    /// block. The stage is uploaded in both cases. An entirely unchanged
+    /// sentinel buffer is rejected; otherwise uploaded bytes are preserved
+    /// without guessing a valid length from their contents. A failed status
+    /// is logged because NAND completeness remains uncertain.
+    /// A TRANSPORT error is the session dying
     /// and propagates to the caller, which reconnects and retries the
     /// same range.
     pub fn read_nand_range(
@@ -811,17 +814,14 @@ impl<T: Transport> AmlogicSession<T> {
                 staged += chunk.len();
             }
 
-            // The staging buffer was pre-filled with 0xa5. If the read
-            // stopped early, the untouched tail still holds it; a full
-            // buffer (even after `failed:`) is real data.
-            let untouched = out[total..total + staged]
-                .iter()
-                .rev()
-                .take_while(|&&b| b == 0xa5)
-                .count();
-            let valid = staged - untouched;
+            // A suffix of 0xa5 is ambiguous: it may be real NAND data,
+            // not untouched staging RAM. Never infer a byte count from
+            // its contents. Preserve every uploaded byte once the buffer
+            // changed; a rejected command still leaves NAND completeness
+            // uncertain and must remain visible in the diagnostic log.
+            let unchanged = staged > 0 && out[total..total + staged].iter().all(|&b| b == 0xa5);
             if let Some(error) = read_failure {
-                if valid == 0 {
+                if unchanged {
                     if stop() {
                         break;
                     }
@@ -835,25 +835,11 @@ impl<T: Transport> AmlogicSession<T> {
                     );
                     break;
                 }
-                if valid == stage {
-                    log::warn!(
-                        "nand read at {:#x} reported {error} but staged the whole \
-                         {stage:#x}-byte block; keeping it",
-                        off + total as u32
-                    );
-                } else {
-                    log::warn!(
-                        "nand read rejected at {:#x}: keeping {valid:#x} of {staged:#x} \
-                         staged bytes ({error})",
-                        off + total as u32
-                    );
-                }
-                total += valid;
-                progress(total);
-                if valid < staged {
-                    break;
-                }
-                continue;
+                log::warn!(
+                    "nand read at {:#x} reported {error}; preserving all {staged:#x} \
+                     uploaded bytes without trimming; NAND completeness is uncertain",
+                    off + total as u32
+                );
             }
 
             // a successful read that left the sentinel untouched did

@@ -50,11 +50,10 @@ pub struct DumpState {
     pub off: u32,
     pub size: usize,
     pub data: Vec<u8>,
-    /// Set when the staging buffer kept part of the 0xa5 sentinel: the
-    /// received prefix is the truth (bad blocks; flasher.sh
-    /// `readable_size`). A `failed:` status with a fully staged block is
-    /// not a short read — the live gadget fills the whole range and
-    /// still reports the bad block it skipped.
+    /// Set when the range reader returns fewer bytes than requested.
+    /// A `failed:` status with a changed staging buffer does not imply a
+    /// known shorter length: all uploaded bytes are preserved and the
+    /// uncertain NAND completeness is logged by the range reader.
     pub short_read: bool,
 }
 
