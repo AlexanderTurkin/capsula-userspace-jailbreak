@@ -240,8 +240,17 @@ fn run_backup(wait: Option<Duration>) -> anyhow::Result<()> {
             println!("done: dumps are in backup/ (nothing was written to the device)");
         }
         Target::Amlogic => {
-            amlogic_scenario(wait)?;
-            bail!("partition backup for the Amlogic mini is not implemented yet");
+            let ui = progress::CliProgress::new();
+            let progress = |p| ui.handle(p);
+            let (mut session, soc) = target::bring_up_amlogic(wait, &progress)?;
+            require_aml_tpl(&soc)?;
+            let report =
+                jb_core::aml::backup::backup(&mut session, Path::new("backup"), &progress)?;
+            match report.status {
+                jb_core::aml::backup::Status::Complete => println!("done: Amlogic backup is in {}", report.path.display()),
+                jb_core::aml::backup::Status::Warnings => println!("Amlogic backup has short partitions: {} (see manifest.json and .partial files)", report.path.display()),
+                _ => unreachable!("backup returns only finalized reports"),
+            }
         }
     }
     Ok(())
@@ -574,7 +583,7 @@ fn dump_pass(
         if failures_at_offset > MAX_OFFSET_FAILURES {
             bail!(
                 "dump stuck at +{:#x} after {MAX_OFFSET_FAILURES} reconnect attempts: \
-                 power-cycle the speaker and re-run to resume from the checkpoint",
+                 power-cycle the speaker and re-run to start a new dump",
                 st.done()
             );
         }

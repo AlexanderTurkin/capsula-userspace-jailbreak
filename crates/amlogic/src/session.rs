@@ -481,7 +481,7 @@ impl<T: Transport> AmlogicSession<T> {
     /// are collected or the device announces an empty burst (the stream
     /// ended early — bad blocks shorten NAND-backed uploads). Returns
     /// what arrived; exact callers check the length themselves.
-    fn receive_upload(
+    pub(crate) fn receive_upload(
         &mut self,
         total: usize,
         stop: &dyn Fn() -> bool,

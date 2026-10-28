@@ -37,6 +37,15 @@ capsula-jb — quick start
    capsula-jb aml        Amlogic mini: identify / run u-boot commands
    capsula-jb --help     all options
 
+   On Amlogic A113X, `backup` creates backup/amlogic-*/ with the env,
+   eight partitions, five reserved regions and nand-full.raw.bin
+   (256 MiB NAND + OOB = 264 MiB). Each image uses one device pass;
+   SHA256 checks saved files, without rereading NAND or RAM for comparison.
+   Check manifest.json: complete = full sizes; warnings = short partitions;
+   failed/running = unfinished. Short/interrupted files retain .partial.
+   A new run starts a new directory. No restore command is provided.
+   The default Amlogic scenario only identifies the board.
+
 3. When the tool reports "ADB is up" (Rockchip boards), connect over USB:
    adb devices && adb shell       (root shell, no authorization)
 

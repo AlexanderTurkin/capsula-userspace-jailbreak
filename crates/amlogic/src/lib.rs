@@ -26,6 +26,7 @@
 
 pub mod checksum;
 pub mod error;
+pub mod nand;
 pub mod session;
 pub mod soc;
 
