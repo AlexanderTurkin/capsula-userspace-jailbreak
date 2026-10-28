@@ -294,9 +294,7 @@ impl<T: Transport> AmlogicSession<T> {
     /// of the earlier revisions.
     pub fn read_bulk_reply(&mut self) -> Result<String> {
         let mut buf = [0u8; BULK_REPLY_LEN];
-        let n = self
-            .transport
-            .bulk_read_upto(self.ep_in, &mut buf)?;
+        let n = self.transport.bulk_read_upto(self.ep_in, &mut buf)?;
         let text = nul_trim(&buf[..n]);
         log::debug!("amlogic: bulk reply {n}b: {text}");
         Ok(text)
@@ -445,7 +443,9 @@ impl<T: Transport> AmlogicSession<T> {
     /// `size`, streamed in device-paced [`UPLOAD_SLOT`] bursts.
     pub fn upload_read(&mut self, addr: u32, size: usize) -> Result<Vec<u8>> {
         if size == 0 || size > 0x80_0000 {
-            return Err(Error::Usb(format!("upload mem size {size:#x} out of 1..=0x800000")));
+            return Err(Error::Usb(format!(
+                "upload mem size {size:#x} out of 1..=0x800000"
+            )));
         }
         let cmd = format!("upload mem {addr:#x} normal {size:#x}");
         self.send_bulk_cmd(&cmd)?;
@@ -471,7 +471,9 @@ impl<T: Transport> AmlogicSession<T> {
         progress: &dyn Fn(usize),
     ) -> Result<Vec<u8>> {
         if size == 0 || size > 0x80_0000 {
-            return Err(Error::Usb(format!("upload mem size {size:#x} out of 1..=0x800000")));
+            return Err(Error::Usb(format!(
+                "upload mem size {size:#x} out of 1..=0x800000"
+            )));
         }
         self.send_bulk_cmd(&format!("upload mem {addr:#x} normal {size:#x}"))?;
         let status = self.wait_bulk_status()?;

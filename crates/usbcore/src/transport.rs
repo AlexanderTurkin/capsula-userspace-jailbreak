@@ -18,6 +18,11 @@ pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 /// flasher uses 5 s for bulk reads too.
 pub const BULK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum bytes per host bulk-IN request. nusb enables WinUSB RAW_IO,
+/// which does not split oversized requests; use the same 1 MiB ceiling
+/// for both vendor protocols. Bulk-OUT is split by WinUSB itself.
+pub const BULK_IN_MAX: usize = 1024 * 1024;
+
 /// Minimal synchronous transport needed by the vendor protocols.
 /// Production: [`NusbTransport`]; tests: [`crate::MockTransport`].
 pub trait Transport {
@@ -36,8 +41,8 @@ pub trait Transport {
     /// full).
     fn bulk_read(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<()>;
 
-    /// Read UP TO buf.len() bytes from a bulk-IN endpoint: one transfer,
-    /// short packets included. Reply frames of the vendor protocols may
+    /// Read UP TO buf.len() bytes from a bulk-IN endpoint: one transfer
+    /// capped at [`BULK_IN_MAX`], short packets included. Reply frames may
     /// be shorter than the buffer (the reference flasher tolerates
     /// short status reads); blocking for the full buffer would wedge
     /// the pipe after a short reply.
@@ -198,19 +203,25 @@ impl Transport for NusbTransport {
     }
 
     fn bulk_read(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<()> {
-        let ep = self
-            .interface
-            .endpoint::<nusb::transfer::Bulk, nusb::transfer::In>(endpoint)
-            .map_err(|e| Error::Usb(e.to_string()))?;
-        let mut reader = ep.reader(buf.len().max(512));
-        reader.set_read_timeout(BULK_TIMEOUT);
-        reader
-            .read_exact(buf)
-            .map_err(|e| Error::Usb(e.to_string()))?;
-        Ok(())
+        read_bulk_chunks(buf, |chunk| {
+            let ep = self
+                .interface
+                .endpoint::<nusb::transfer::Bulk, nusb::transfer::In>(endpoint)
+                .map_err(|e| Error::Usb(e.to_string()))?;
+            let mut reader = ep.reader(chunk.len().max(512));
+            reader.set_read_timeout(BULK_TIMEOUT);
+            reader
+                .read_exact(chunk)
+                .map_err(|e| Error::Usb(e.to_string()))
+        })
     }
 
     fn bulk_read_upto(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<usize> {
+        let len = buf.len().min(BULK_IN_MAX);
+        if len == 0 {
+            return Ok(0);
+        }
+        let buf = &mut buf[..len];
         let ep = self
             .interface
             .endpoint::<nusb::transfer::Bulk, nusb::transfer::In>(endpoint)
@@ -218,8 +229,53 @@ impl Transport for NusbTransport {
         let mut reader = ep.reader(buf.len().max(512));
         reader.set_read_timeout(BULK_TIMEOUT);
         // one transfer: a short packet ends it, and that IS the reply
-        reader
-            .read(buf)
-            .map_err(|e| Error::Usb(e.to_string()))
+        reader.read(buf).map_err(|e| Error::Usb(e.to_string()))
+    }
+}
+
+/// Read a data phase through individual host requests.
+fn read_bulk_chunks(
+    buf: &mut [u8],
+    mut read_chunk: impl FnMut(&mut [u8]) -> Result<()>,
+) -> Result<()> {
+    for chunk in buf.chunks_mut(BULK_IN_MAX) {
+        read_chunk(chunk)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bulk_in_splits_above_one_mib() {
+        // Model the host's RAW_IO ceiling, leaving the actual chunking
+        // and reconstruction to the production data-phase reader.
+        let source: Vec<u8> = (0..1_049_088).map(|i| (i % 251) as u8).collect();
+        let mut output = vec![0; source.len()];
+        let mut offset = 0;
+        let mut requests = Vec::new();
+        read_bulk_chunks(&mut output, |chunk| {
+            if chunk.len() > 1_048_576 {
+                return Err(Error::Usb("RAW_IO request exceeds host limit".into()));
+            }
+            requests.push(chunk.len());
+            chunk.copy_from_slice(&source[offset..offset + chunk.len()]);
+            offset += chunk.len();
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(requests, [1_048_576, 512]);
+        assert_eq!(output, source);
+    }
+
+    #[test]
+    fn bulk_in_empty_data_phase_skips_usb() {
+        read_bulk_chunks(&mut [], |_| {
+            Err(Error::Usb("an empty data phase must not access USB".into()))
+        })
+        .unwrap();
     }
 }

@@ -28,9 +28,9 @@ use jb_core::config::Config;
 use jb_core::session::{bring_up, BringUpError, Progress, ProgressFn};
 use jb_core::target::{self, Target};
 use jb_core::{backup, flash, ota, userdata};
-use sha2::{Digest, Sha256};
 use rockusb::loader::RESET_SUBCODE_NORMAL;
 use rockusb::{LoaderContainer, NusbTransport};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -88,6 +88,12 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // An elevated relaunch (Windows UAC manifest) may start in
+    // C:\Windows\System32; the tool writes ota/backup/work relative to
+    // the CWD, so move next to the executable in that case.
+    if let Some(cwd) = win_drv::fix_cwd_if_system32() {
+        eprintln!("working directory: {}", cwd.display());
+    }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
     let wait = if cli.wait == 0 {
@@ -95,14 +101,20 @@ fn main() -> anyhow::Result<()> {
     } else {
         Some(Duration::from_secs(cli.wait))
     };
-    match cli.command {
+    let result = match cli.command {
         None => run_jailbreak(wait, cli.yes, cli.format_userdata),
         Some(Command::Backup) => run_backup(wait),
         Some(Command::Monitor) => monitor(),
         Some(Command::Aml { cmds }) => run_amlogic(wait, &cmds),
         Some(Command::AmlEnv) => run_aml_env(wait),
         Some(Command::AmlDump { part }) => run_aml_dump(wait, &part),
-    }
+    };
+    // Launched from a normal console, Windows elevates the tool into a
+    // NEW console window (see the UAC manifest note in .cargo/config.toml);
+    // keep that window open so the output is readable. A shared terminal
+    // or a redirected/none console gets no pause.
+    win_drv::pause_if_own_console();
+    result
 }
 
 fn print_step(ev: Progress) {
@@ -124,9 +136,83 @@ fn detect_target(wait: Option<Duration>) -> anyhow::Result<Target> {
         .context("failed while waiting for a supported speaker on the bus")
 }
 
-/// Rockchip steps 1-3: loader, device bring-up, full dump into backup/.
-/// Returns the live usbplug session (usable for the subsequent write).
+/// Steps 1-3: loader, device, full dump into backup/, with automatic
+/// WinUSB driver supervision on Windows. Returns the live usbplug
+/// session (usable for the subsequent write).
+///
+/// On Windows the board hops between devnodes (330d loader, 330e
+/// MaskROM/usbplug) and a fresh devnode may be grabbed by a vendor
+/// Rockusb driver before our WinUSB package gets it; when that
+/// happens the session rebinds the node and the bring-up — which is a
+/// re-entrant state machine over the current bus state — is retried.
 fn rockchip_dump_all(
+    wait: Option<Duration>,
+    drivers: &mut win_drv::Session,
+) -> anyhow::Result<rockusb::LoaderSession<NusbTransport>> {
+    if win_drv::any_rockchip_node_misbound() {
+        println!("a Rockchip device is present without WinUSB — installing the driver");
+        start_or_wait_drivers(drivers, Duration::from_secs(180));
+    }
+
+    const ATTEMPTS: u32 = 5;
+    for attempt in 1..=ATTEMPTS {
+        match rockchip_dump_all_once(wait) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                if attempt < ATTEMPTS && win_drv::chain_is_binding_error(&e) {
+                    println!(
+                        "device node caught a non-WinUSB driver (attempt {attempt}/{ATTEMPTS}) — rebinding and retrying"
+                    );
+                    start_or_wait_drivers(drivers, Duration::from_secs(120));
+                    continue;
+                }
+                if win_drv::chain_is_binding_error(&e) {
+                    // the driver supervisor could not win in ATTEMPTS tries
+                    return Err(e.context(format!(
+                        "the WinUSB driver did not settle; session log: {}\n\
+                         manual fallback: see DRIVER-SETUP.txt (Zadig)",
+                        drivers.log_path().display()
+                    )));
+                }
+                return Err(e);
+            }
+        }
+    }
+    unreachable!("the retry loop always returns")
+}
+
+/// Make sure the driver supervisor is running, then wait for the board
+/// to actually settle on WinUSB. The process is elevated from the very
+/// start (UAC manifest), so this is pure install time: certificates,
+/// the driver package import and the devnode restart take a few seconds
+/// on a first run.
+fn start_or_wait_drivers(drivers: &mut win_drv::Session, settle: Duration) {
+    match drivers.ensure_supervision() {
+        Ok(()) => {
+            println!(
+                "installing the WinUSB driver if needed (up to {} s)...",
+                settle.as_secs()
+            );
+            if !win_drv::wait_until_bound(settle) {
+                println!(
+                    "warning: the driver did not settle in {} s (session log: {})",
+                    settle.as_secs(),
+                    drivers.log_path().display()
+                );
+            }
+        }
+        Err(e) => {
+            println!(
+                "warning: {e}\n  manual fallback: see DRIVER-SETUP.txt (Zadig)\n  \
+                 session log: {}",
+                drivers.log_path().display()
+            );
+        }
+    }
+}
+
+/// One bring-up + dump attempt (no retries).
+fn rockchip_dump_all_once(
     wait: Option<Duration>,
 ) -> anyhow::Result<rockusb::LoaderSession<NusbTransport>> {
     let config = Config::embedded();
@@ -149,7 +235,8 @@ fn rockchip_dump_all(
 fn run_backup(wait: Option<Duration>) -> anyhow::Result<()> {
     match detect_target(wait)? {
         Target::Rockchip(_) => {
-            let _session = rockchip_dump_all(wait)?;
+            let mut drivers = win_drv::Session::new();
+            let _session = rockchip_dump_all(wait, &mut drivers)?;
             println!("done: dumps are in backup/ (nothing was written to the device)");
         }
         Target::Amlogic => {
@@ -174,7 +261,8 @@ fn rockchip_jailbreak(
     yes: bool,
     format_userdata: bool,
 ) -> anyhow::Result<()> {
-    let mut s = rockchip_dump_all(wait)?;
+    let mut drivers = win_drv::Session::new();
+    let mut s = rockchip_dump_all(wait, &mut drivers)?;
 
     // step 4: overlay on top of the userdata dump
     let store = BackupStore::open(Path::new("backup")).context("no valid backup in backup/")?;
@@ -503,7 +591,12 @@ fn dump_pass(
         );
     }
 
-    jb_core::aml::write_dump(Path::new("backup"), &format!("{part}{suffix}"), &st.data, progress)?;
+    jb_core::aml::write_dump(
+        Path::new("backup"),
+        &format!("{part}{suffix}"),
+        &st.data,
+        progress,
+    )?;
     let note = if st.short_read {
         " (short read: bad blocks — the received length is the truth)"
     } else {

@@ -131,8 +131,7 @@ impl Transport for MockTransport {
                     return Err(Error::Usb("mock: bulk_read_upto would overflow".into()));
                 }
                 buf[..data.len()].copy_from_slice(&data);
-                self.log
-                    .push(format!("in ep{endpoint:#x} {}b", data.len()));
+                self.log.push(format!("in ep{endpoint:#x} {}b", data.len()));
                 Ok(data.len())
             }
             other => Err(Error::Usb(format!("mock: expected data, got {other:?}"))),
