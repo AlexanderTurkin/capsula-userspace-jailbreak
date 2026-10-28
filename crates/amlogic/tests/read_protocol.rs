@@ -308,6 +308,7 @@ fn upload_empty_payload_error_identifies_stream_offset_and_announced_burst() {
         Step::ControlIn(req::READ_MEDIA, 4096, 1, head(4)),
         Step::BulkIn(b"abcd".to_vec()),
         Step::ControlIn(req::READ_MEDIA, 4096, 1, head(4)),
+        Step::BulkIn(b"ef".to_vec()),
         Step::BulkIn(vec![]),
     ]);
     let mut s = session(steps);
@@ -318,6 +319,53 @@ fn upload_empty_payload_error_identifies_stream_offset_and_announced_burst() {
     assert!(error.to_string().contains("stream offset 0x4"));
     assert!(error.to_string().contains("announced 0x4"));
     assert!(error.to_string().contains("head="));
-    assert_eq!(out, b"abcd");
+    assert_eq!(out, b"abcdef");
     assert_eq!(s.transport().pos, s.transport().steps.len());
+}
+
+#[test]
+fn upload_store_boundary_zlp_retains_completed_bursts_as_short_stream() {
+    let mut steps = armed("upload store data normal 0x20000");
+    steps.extend([
+        Step::ControlIn(req::READ_MEDIA, 4096, 16, head(65536)),
+        Step::BulkIn(vec![0x42; 65536]),
+        Step::ControlIn(req::READ_MEDIA, 4096, 16, head(65536)),
+        Step::BulkIn(vec![]),
+    ]);
+    let mut s = session(steps);
+    let mut out = Vec::new();
+    assert_eq!(
+        s.upload_store_to("data", 131072, &mut out, &|_| {})
+            .unwrap(),
+        65536
+    );
+    assert_eq!(out, vec![0x42; 65536]);
+    assert_eq!(s.transport().pos, s.transport().steps.len());
+}
+
+#[test]
+fn ram_boundary_zlp_remains_an_error() {
+    let mut steps = armed("upload mem 0x2000000 normal 0x20000");
+    steps.extend([
+        Step::ControlIn(req::READ_MEDIA, 4096, 16, head(65536)),
+        Step::BulkIn(vec![0x42; 65536]),
+        Step::ControlIn(req::READ_MEDIA, 4096, 16, head(65536)),
+        Step::BulkIn(vec![]),
+    ]);
+    let mut s = session(steps);
+    assert!(s.read_dram(amlogic::ENV_ADDR, 131072, &|_| {}).is_err());
+    assert_eq!(s.transport().pos, s.transport().steps.len());
+}
+
+#[test]
+fn upload_store_empty_first_burst_is_error() {
+    let mut steps = armed("upload store data normal 0x10000");
+    steps.extend([
+        Step::ControlIn(req::READ_MEDIA, 4096, 16, head(65536)),
+        Step::BulkIn(vec![]),
+    ]);
+    let mut s = session(steps);
+    assert!(s
+        .upload_store_to("data", 65536, &mut Vec::new(), &|_| {})
+        .is_err());
 }

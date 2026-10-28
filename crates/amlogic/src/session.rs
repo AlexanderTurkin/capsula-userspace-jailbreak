@@ -416,7 +416,7 @@ impl<T: Transport> AmlogicSession<T> {
     ) -> Result<(Vec<u8>, [u8; 16])> {
         let (head, size) = self.upload_head(hint, remaining)?;
         let mut data = Vec::with_capacity(size);
-        self.read_upload_payload(size, &mut data, &|_| {})?;
+        self.read_upload_payload(size, &mut data, &|_| {}, false)?;
         Ok((data, head))
     }
 
@@ -449,7 +449,8 @@ impl<T: Transport> AmlogicSession<T> {
         size: usize,
         out: &mut dyn Write,
         progress: &dyn Fn(usize),
-    ) -> Result<()> {
+        allow_empty: bool,
+    ) -> Result<usize> {
         let mut buf = [0u8; UPLOAD_SLOT];
         let mut received = 0;
         while received < size {
@@ -461,6 +462,13 @@ impl<T: Transport> AmlogicSession<T> {
                 }
                 Err(error) => return Err(error.into()),
             };
+            // The gadget announces the burst before staging storage data.
+            // A staging failure deliberately sends a ZLP to stop upload.
+            // Only a store stream with complete previous bursts may keep it
+            // as a short image; RAM and truncated bursts must still fail.
+            if n == 0 && received == 0 && failure.is_none() && allow_empty {
+                return Ok(0);
+            }
             if n == 0 || n > want {
                 return Err(Error::InvalidResponse(format!(
                     "upload payload: got {n} bytes for {want} remaining"
@@ -473,7 +481,7 @@ impl<T: Transport> AmlogicSession<T> {
                 return Err(error.into());
             }
         }
-        Ok(())
+        Ok(received)
     }
 
     /// Stream an armed `upload ...` command to completion: sequential
@@ -488,7 +496,7 @@ impl<T: Transport> AmlogicSession<T> {
         progress: &dyn Fn(usize),
     ) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(total.min(1 << 20));
-        self.receive_upload_to(total, stop, &mut out, progress)?;
+        self.receive_upload_to(total, stop, &mut out, progress, false)?;
         Ok(out)
     }
 
@@ -498,6 +506,7 @@ impl<T: Transport> AmlogicSession<T> {
         stop: &dyn Fn() -> bool,
         out: &mut dyn Write,
         progress: &dyn Fn(usize),
+        allow_short_payload: bool,
     ) -> Result<usize> {
         let mut received = 0;
         while received < total {
@@ -508,14 +517,18 @@ impl<T: Transport> AmlogicSession<T> {
             if size == 0 {
                 break;
             }
-            self.read_upload_payload(size, out, &|n| progress(received + n))
+            let actual = self.read_upload_payload(size, out, &|n| progress(received + n), allow_short_payload && received > 0)
                 .map_err(|error| match error {
                     Error::InvalidResponse(detail) => Error::InvalidResponse(format!(
                         "{detail}; stream offset {received:#x} (burst start), announced {size:#x}, total {total:#x}, head={head:02x?}"
                     )),
                     other => other,
                 })?;
-            received += size;
+            if actual == 0 {
+                log::warn!("store upload stopped with a ZLP at {received:#x} of {total:#x}; keeping a short image (announced {size:#x})");
+                break;
+            }
+            received += actual;
         }
         Ok(received)
     }
@@ -713,7 +726,9 @@ impl<T: Transport> AmlogicSession<T> {
 
     /// Stream a known partition into a writer using at most one 64 KiB
     /// payload buffer. A zero upload head is a short stream, not proof
-    /// of a bad block. Transport and writer errors propagate, leaving
+    /// of a bad block. A boundary ZLP after complete bursts is also kept
+    /// as a short image: the gadget uses it when storage staging fails.
+    /// Transport and writer errors propagate, leaving
     /// completed writes in `out`; the caller decides how to retain them.
     pub fn upload_store_to(
         &mut self,
@@ -733,7 +748,7 @@ impl<T: Transport> AmlogicSession<T> {
             return Ok(0);
         }
         self.bulk_cmd(&format!("upload store {part} normal {total:#x}"))?;
-        let received = self.receive_upload_to(total, &|| false, out, progress)?;
+        let received = self.receive_upload_to(total, &|| false, out, progress, true)?;
         if received < total {
             log::warn!("upload store {part}: stream ended at {received:#x} of {total:#x} bytes");
         }

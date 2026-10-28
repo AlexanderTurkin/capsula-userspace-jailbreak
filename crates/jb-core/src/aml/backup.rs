@@ -141,6 +141,22 @@ fn bytes(dir: &CaptureDirectory, m: &mut Manifest, name: &str, data: &[u8]) -> a
     drop(f);
     record(dir, m, name, data.len() as u64, data.len() as u64)
 }
+fn environment_text(raw: &[u8]) -> anyhow::Result<&str> {
+    ensure!(raw.len() == amlogic::ENV_SIZE, "short environment snapshot");
+    let end = raw
+        .iter()
+        .position(|b| *b == 0)
+        .context("environment is not NUL-terminated")?;
+    let text = std::str::from_utf8(&raw[..end]).context("environment is not UTF-8")?;
+    ensure!(
+        text.lines().any(|line| line
+            .split_once('=')
+            .is_some_and(|(key, _)| !key.is_empty() && !key.chars().any(char::is_whitespace))),
+        "invalid exported environment: no key=value entries"
+    );
+    Ok(text)
+}
+
 fn capture(
     dev: &mut impl Device,
     parent: &Path,
@@ -164,12 +180,8 @@ fn capture(
         progress(Progress::Step("Amlogic: capture environment".into()));
         let env = dev.env()?;
         ensure!(env.len() == amlogic::ENV_SIZE, "short environment snapshot");
-        let end = env
-            .iter()
-            .position(|b| *b == 0)
-            .context("environment is not NUL-terminated")?;
-        let text = std::str::from_utf8(&env[..end]).context("environment is not UTF-8")?;
         bytes(&dir, &mut m, "env-export.bin", &env)?;
+        let text = environment_text(&env)?;
         bytes(&dir, &mut m, "env.txt", text.as_bytes())?;
         for &(name, _, size) in layout.partitions {
             let filename = format!("{name}.bin");
@@ -366,6 +378,12 @@ fn validate(path: &Path, m: &Manifest, layout: &Layout<'_>) -> anyhow::Result<()
         );
     }
     ensure!(expected.is_empty(), "missing capture inventory");
+    let env = std::fs::read(path.join("env-export.bin"))?;
+    let text = environment_text(&env)?;
+    ensure!(
+        std::fs::read(path.join("env.txt"))? == text.as_bytes(),
+        "environment text differs from its raw export"
+    );
     ensure!(
         (m.status == Status::Warnings) == short,
         "inconsistent completion status"
@@ -392,6 +410,7 @@ mod tests {
         calls: RefCell<Vec<String>>,
         short: bool,
         fail: bool,
+        environment: Option<Vec<u8>>,
     }
     impl Fake {
         fn new() -> Self {
@@ -399,13 +418,18 @@ mod tests {
                 calls: RefCell::new(Vec::new()),
                 short: false,
                 fail: false,
+                environment: None,
             }
         }
     }
     impl Device for Fake {
         fn env(&mut self) -> anyhow::Result<Vec<u8>> {
             self.calls.borrow_mut().push("env".into());
-            Ok(vec![0; amlogic::ENV_SIZE])
+            Ok(self.environment.clone().unwrap_or_else(|| {
+                let mut data = vec![0; amlogic::ENV_SIZE];
+                data[..4].copy_from_slice(b"a=b\n");
+                data
+            }))
         }
         fn partition(
             &mut self,
@@ -498,6 +522,53 @@ mod tests {
             vec![1; 3]
         );
         assert!(verify_layout(&dir, &layout()).is_err());
+        std::fs::remove_dir_all(parent.path()).unwrap();
+    }
+    #[test]
+    fn invalid_environment_fails_before_partitions_and_keeps_raw_snapshot() {
+        for prefix in [b"".as_slice(), b"garbage", b"\xff=x"] {
+            let parent = parent();
+            let mut dev = Fake::new();
+            let mut raw = vec![0; amlogic::ENV_SIZE];
+            raw[..prefix.len()].copy_from_slice(prefix);
+            dev.environment = Some(raw.clone());
+            assert!(capture(&mut dev, parent.path(), &|_| {}, &layout()).is_err());
+            let dir = std::fs::read_dir(parent.path())
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            assert_eq!(std::fs::read(dir.join("env-export.bin")).unwrap(), raw);
+            assert!(!dir.join("env.txt").exists());
+            let m: Manifest =
+                serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+            assert_eq!(m.status, Status::Failed);
+            assert_eq!(*dev.calls.borrow(), ["env"]);
+            std::fs::remove_dir_all(parent.path()).unwrap();
+        }
+    }
+    #[test]
+    fn verifier_rejects_invalid_environment_even_with_matching_checksums() {
+        let parent = parent();
+        let report = capture(&mut Fake::new(), parent.path(), &|_| {}, &layout()).unwrap();
+        let mp = report.path.join("manifest.json");
+        let mut m: Manifest = serde_json::from_slice(&std::fs::read(&mp).unwrap()).unwrap();
+        for f in &mut m.files {
+            let data = match f.name.as_str() {
+                "env-export.bin" => Some(vec![0; amlogic::ENV_SIZE]),
+                "env.txt" => Some(Vec::new()),
+                _ => None,
+            };
+            if let Some(data) = data {
+                std::fs::write(report.path.join(&f.name), &data).unwrap();
+                f.expected = data.len() as u64;
+                f.actual = f.expected;
+                f.sha256 = file_sha256(&report.path.join(&f.name)).unwrap();
+            }
+        }
+        std::fs::write(&mp, serde_json::to_vec(&m).unwrap()).unwrap();
+        assert!(verify_layout(&report.path, &layout()).is_err());
         std::fs::remove_dir_all(parent.path()).unwrap();
     }
     #[test]
