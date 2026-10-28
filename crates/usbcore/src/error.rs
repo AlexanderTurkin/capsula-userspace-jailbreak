@@ -12,6 +12,9 @@ pub enum Error {
     /// USB transport error.
     #[error("usb: {0}")]
     Usb(String),
+    /// Bytes in the caller buffer are valid even though this completion failed.
+    #[error("bulk read failed after {transferred} bytes: {reason}")]
+    PartialRead { transferred: usize, reason: String },
     /// I/O error.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

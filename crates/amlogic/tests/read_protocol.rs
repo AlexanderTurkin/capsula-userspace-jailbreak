@@ -280,3 +280,23 @@ fn malformed_prime_status_is_not_retried_as_a_pipe_failure() {
     assert!(s.prime().is_err());
     assert_eq!(s.transport().pos, 2);
 }
+
+#[test]
+fn upload_preserves_bytes_from_an_errored_completion_and_stops() {
+    for prefix in [b"ab".as_slice(), b"abcd".as_slice()] {
+        let mut steps = armed("upload store bootloader normal 0x4");
+        steps.extend([
+            Step::ControlIn(req::READ_MEDIA, 4096, 1, head(4)),
+            Step::BulkPartialError(prefix.to_vec(), "device disconnected".into()),
+            Step::BulkIn(b"cd".to_vec()),
+        ]);
+        let mut s = session(steps);
+        let mut out = Vec::new();
+        let err = s
+            .upload_store_to("bootloader", 4, &mut out, &|_| {})
+            .unwrap_err();
+        assert!(matches!(err, Error::Usb(ref text) if text.contains("disconnected")));
+        assert_eq!(out, prefix);
+        assert_eq!(s.transport().pos, 4);
+    }
+}

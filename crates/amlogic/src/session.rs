@@ -454,9 +454,13 @@ impl<T: Transport> AmlogicSession<T> {
         let mut received = 0;
         while received < size {
             let want = size - received;
-            let n = self
-                .transport
-                .bulk_read_upto(self.ep_in, &mut buf[..want])?;
+            let (n, failure) = match self.transport.bulk_read_upto(self.ep_in, &mut buf[..want]) {
+                Ok(n) => (n, None),
+                Err(error @ usbcore::Error::PartialRead { transferred, .. }) => {
+                    (transferred, Some(error))
+                }
+                Err(error) => return Err(error.into()),
+            };
             if n == 0 || n > want {
                 return Err(Error::InvalidResponse(format!(
                     "upload payload: got {n} bytes for {want} remaining"
@@ -465,6 +469,9 @@ impl<T: Transport> AmlogicSession<T> {
             out.write_all(&buf[..n])?;
             received += n;
             progress(received);
+            if let Some(error) = failure {
+                return Err(error.into());
+            }
         }
         Ok(())
     }

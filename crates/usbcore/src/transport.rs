@@ -46,6 +46,9 @@ pub trait Transport {
     /// be shorter than the buffer (the reference flasher tolerates
     /// short status reads); blocking for the full buffer would wedge
     /// the pipe after a short reply.
+    /// A zero-length completion returns Ok(0). On [`Error::PartialRead`],
+    /// the first `transferred` bytes in `buf` are valid; keep the bytes
+    /// and propagate the error rather than treating it as a short success.
     fn bulk_read_upto(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<usize>;
 }
 
@@ -232,14 +235,27 @@ impl Transport for NusbTransport {
             return Ok(0);
         }
         let buf = &mut buf[..len];
-        let ep = self
+        let mut ep = self
             .interface
             .endpoint::<nusb::transfer::Bulk, nusb::transfer::In>(endpoint)
             .map_err(|e| Error::Usb(e.to_string()))?;
-        let mut reader = ep.reader(buf.len().max(512));
-        reader.set_read_timeout(BULK_TIMEOUT);
-        // one transfer: a short packet ends it, and that IS the reply
-        reader.read(buf).map_err(|e| Error::Usb(e.to_string()))
+        let packet = ep.max_packet_size();
+        if packet == 0 || packet > BULK_IN_MAX {
+            return Err(Error::Usb(format!("invalid bulk packet size: {packet}")));
+        }
+        let request_len = buf.len().div_ceil(packet) * packet;
+        if request_len > BULK_IN_MAX {
+            return Err(Error::Usb("aligned bulk request exceeds host limit".into()));
+        }
+        // EndpointRead::read skips ZLPs and defers errors until its next
+        // call. Consume one raw completion instead: preserve both its
+        // bytes and status, with no internal resubmission on a ZLP.
+        ep.submit(nusb::transfer::Buffer::new(request_len));
+        let completion = ep
+            .wait_next_complete(BULK_TIMEOUT)
+            .ok_or_else(|| Error::Usb("timeout waiting for bulk read".into()))?;
+        // Dropping ep also cancels a pending request on timeout.
+        complete_bulk_read(completion, buf)
     }
 }
 
@@ -262,9 +278,80 @@ fn unique_device<T>(mut devices: impl Iterator<Item = T>) -> Result<T> {
     Ok(device)
 }
 
+fn complete_bulk_read(completion: nusb::transfer::Completion, buf: &mut [u8]) -> Result<usize> {
+    let n = completion.actual_len;
+    if n > buf.len() || n > completion.buffer.len() {
+        return Err(Error::Usb(format!(
+            "invalid bulk completion length: {n} (buffer {})",
+            buf.len()
+        )));
+    }
+    buf[..n].copy_from_slice(&completion.buffer[..n]);
+    match completion.status {
+        Ok(()) => Ok(n),
+        Err(error) if n > 0 => Err(Error::PartialRead {
+            transferred: n,
+            reason: error.to_string(),
+        }),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_completion_keeps_partial_data_and_error() {
+        let completion = nusb::transfer::Completion {
+            buffer: b"ab".as_slice().into(),
+            actual_len: 2,
+            status: Err(nusb::transfer::TransferError::Disconnected),
+        };
+        let mut out = [0; 4];
+        assert!(matches!(
+            complete_bulk_read(completion, &mut out),
+            Err(Error::PartialRead { transferred: 2, .. })
+        ));
+        assert_eq!(&out[..2], b"ab");
+    }
+
+    #[test]
+    fn native_zero_packet_is_observable() {
+        let completion = nusb::transfer::Completion {
+            buffer: Vec::<u8>::new().into(),
+            actual_len: 0,
+            status: Ok(()),
+        };
+        let mut out = [7; 512];
+        assert_eq!(complete_bulk_read(completion, &mut out).unwrap(), 0);
+        assert_eq!(out, [7; 512]);
+    }
+
+    #[test]
+    fn native_overrun_is_rejected_without_overwriting_output() {
+        let completion = nusb::transfer::Completion {
+            buffer: b"abcd".as_slice().into(),
+            actual_len: 4,
+            status: Ok(()),
+        };
+        let mut out = [7; 3];
+        assert!(complete_bulk_read(completion, &mut out).is_err());
+        assert_eq!(out, [7; 3]);
+    }
+
+    #[test]
+    fn native_error_without_data_is_not_a_successful_zlp() {
+        let completion = nusb::transfer::Completion {
+            buffer: Vec::<u8>::new().into(),
+            actual_len: 0,
+            status: Err(nusb::transfer::TransferError::Disconnected),
+        };
+        assert!(matches!(
+            complete_bulk_read(completion, &mut [0; 512]),
+            Err(Error::Usb(_))
+        ));
+    }
 
     #[test]
     fn multiple_devices_are_rejected_before_open() {
