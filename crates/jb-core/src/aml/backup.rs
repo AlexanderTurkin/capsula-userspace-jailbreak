@@ -28,6 +28,8 @@ pub struct BackupReport {
 struct FileRecord {
     name: String,
     expected: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    physical_size: Option<u64>,
     actual: u64,
     sha256: String,
 }
@@ -59,6 +61,7 @@ fn a113x() -> Layout<'static> {
     }
 }
 trait Device {
+    fn partition_size(&mut self, name: &str, physical: usize) -> anyhow::Result<usize>;
     fn env(&mut self) -> anyhow::Result<Vec<u8>>;
     fn partition(
         &mut self,
@@ -70,6 +73,9 @@ trait Device {
     fn nand(&mut self, offset: u32, size: u32, raw: bool) -> anyhow::Result<Vec<u8>>;
 }
 impl<T: usbcore::Transport> Device for AmlogicSession<T> {
+    fn partition_size(&mut self, name: &str, _physical: usize) -> anyhow::Result<usize> {
+        Ok(self.partition_readable_size(name)?)
+    }
     fn env(&mut self) -> anyhow::Result<Vec<u8>> {
         super::capture_env_raw(self)
     }
@@ -110,6 +116,7 @@ fn record(
     name: &str,
     expected: u64,
     actual: u64,
+    physical_size: Option<u64>,
 ) -> anyhow::Result<()> {
     ensure!(actual <= expected, "oversized file {name}");
     let partial = format!("{name}.partial");
@@ -127,6 +134,7 @@ fn record(
     m.files.push(FileRecord {
         name: published,
         expected,
+        physical_size,
         actual,
         sha256: hash,
     });
@@ -139,7 +147,7 @@ fn bytes(dir: &CaptureDirectory, m: &mut Manifest, name: &str, data: &[u8]) -> a
     f.write_all(data)?;
     f.sync_all()?;
     drop(f);
-    record(dir, m, name, data.len() as u64, data.len() as u64)
+    record(dir, m, name, data.len() as u64, data.len() as u64, None)
 }
 fn environment_text(raw: &[u8]) -> anyhow::Result<&str> {
     ensure!(raw.len() == amlogic::ENV_SIZE, "short environment snapshot");
@@ -184,17 +192,27 @@ fn capture(
         let text = environment_text(&env)?;
         bytes(&dir, &mut m, "env.txt", text.as_bytes())?;
         for &(name, _, size) in layout.partitions {
+            let readable = dev
+                .partition_size(name, size as usize)
+                .with_context(|| format!("query logical size of {name}"))?;
+            ensure!(
+                readable > 0 && readable <= size as usize,
+                "invalid logical size for {name}"
+            );
+            if readable < size as usize {
+                progress(Progress::Step(format!("Amlogic: {name} logical size {readable:#x}, physical {size:#x} (bad blocks excluded)")));
+            }
             let filename = format!("{name}.bin");
             progress(Progress::TransferStart {
                 name: name.into(),
-                bytes: size as u64,
+                bytes: readable as u64,
             });
             let mut f = dir.create_file(&format!("{filename}.partial"))?;
-            let received = dev.partition(name, size as usize, &mut f, &|done| {
+            let received = dev.partition(name, readable, &mut f, &|done| {
                 progress(Progress::TransferProgress {
                     name: name.into(),
                     done: done as u64,
-                    total: size as u64,
+                    total: readable as u64,
                 })
             });
             // Sync the received prefix even when the USB operation failed.
@@ -205,10 +223,19 @@ fn capture(
                 .unwrap_or_else(|_| "unknown".into());
             drop(f);
             let received = received.with_context(|| {
-                format!("partition {name}: saved {saved} of {size:#x} bytes in {filename}.partial")
+                format!(
+                    "partition {name}: saved {saved} of {readable:#x} bytes in {filename}.partial"
+                )
             })?;
             synced?;
-            record(&dir, &mut m, &filename, size as u64, received as u64)?;
+            record(
+                &dir,
+                &mut m,
+                &filename,
+                readable as u64,
+                received as u64,
+                Some(size as u64),
+            )?;
             progress(Progress::TransferDone { name: name.into() });
         }
         for &(name, off, size) in layout.reserved {
@@ -247,7 +274,7 @@ fn capture(
         drop(f);
         raw_result?;
         synced?;
-        record(&dir, &mut m, filename, expected, done)?;
+        record(&dir, &mut m, filename, expected, done, None)?;
         progress(Progress::TransferDone {
             name: filename.into(),
         });
@@ -351,9 +378,18 @@ fn validate(path: &Path, m: &Manifest, layout: &Layout<'_>) -> anyhow::Result<()
                 file.expected < amlogic::ENV_SIZE as u64,
                 "oversized environment text"
             );
+        } else if let Some(physical) = file.physical_size {
+            ensure!(
+                can_short && physical == size && file.expected > 0 && file.expected <= physical,
+                "invalid physical/logical size for {name}"
+            );
         } else {
             ensure!(file.expected == size, "unexpected size for {name}");
         }
+        ensure!(
+            file.physical_size.is_none() || can_short,
+            "physical size on non-partition file"
+        );
         let partial = file.actual < file.expected;
         ensure!(
             file.actual <= file.expected && (!partial || can_short),
@@ -411,6 +447,7 @@ mod tests {
         short: bool,
         fail: bool,
         environment: Option<Vec<u8>>,
+        readable: Option<usize>,
     }
     impl Fake {
         fn new() -> Self {
@@ -419,10 +456,15 @@ mod tests {
                 short: false,
                 fail: false,
                 environment: None,
+                readable: None,
             }
         }
     }
     impl Device for Fake {
+        fn partition_size(&mut self, name: &str, physical: usize) -> anyhow::Result<usize> {
+            self.calls.borrow_mut().push(format!("size:{name}"));
+            Ok(self.readable.unwrap_or(physical))
+        }
         fn env(&mut self) -> anyhow::Result<Vec<u8>> {
             self.calls.borrow_mut().push("env".into());
             Ok(self.environment.clone().unwrap_or_else(|| {
@@ -472,6 +514,7 @@ mod tests {
             *dev.calls.borrow(),
             [
                 "env",
+                "size:boot",
                 "boot",
                 "nand:8:false",
                 "nand:0:true",
@@ -522,6 +565,28 @@ mod tests {
             vec![1; 3]
         );
         assert!(verify_layout(&dir, &layout()).is_err());
+        std::fs::remove_dir_all(parent.path()).unwrap();
+    }
+    #[test]
+    fn complete_logical_partition_keeps_physical_size_without_padding() {
+        let parent = parent();
+        let mut dev = Fake::new();
+        dev.readable = Some(6);
+        let report = capture(&mut dev, parent.path(), &|_| {}, &layout()).unwrap();
+        assert_eq!(report.status, Status::Complete);
+        let manifest = verify_layout(&report.path, &layout()).unwrap();
+        let part = manifest
+            .files
+            .iter()
+            .find(|f| f.name == "boot.bin")
+            .unwrap();
+        assert_eq!(part.expected, 6);
+        assert_eq!(part.actual, 6);
+        assert_eq!(part.physical_size, Some(8));
+        assert_eq!(
+            std::fs::read(report.path.join("boot.bin")).unwrap(),
+            vec![1; 6]
+        );
         std::fs::remove_dir_all(parent.path()).unwrap();
     }
     #[test]

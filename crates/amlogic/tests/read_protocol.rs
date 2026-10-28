@@ -369,3 +369,32 @@ fn upload_store_empty_first_burst_is_error() {
         .upload_store_to("data", 65536, &mut Vec::new(), &|_| {})
         .is_err());
 }
+
+#[test]
+fn store_size_reads_u64_logical_capacity() {
+    let mut steps = armed("echo; mw.b 0x1080000 0xa5 0x8");
+    steps.extend(armed("echo; store size data 0x1080000"));
+    steps.extend(armed("upload mem 0x1080000 normal 0x8"));
+    steps.extend([
+        Step::ControlIn(req::READ_MEDIA, 4096, 1, head(8)),
+        Step::BulkIn(0x4dc0000u64.to_le_bytes().to_vec()),
+    ]);
+    let mut s = session(steps);
+    assert_eq!(s.partition_readable_size("data").unwrap(), 0x4dc0000);
+    assert_eq!(s.transport().pos, s.transport().steps.len());
+}
+
+#[test]
+fn store_size_rejects_unknown_partition_and_invalid_capacities() {
+    assert!(session(vec![]).partition_readable_size("bad;cmd").is_err());
+    for size in [0u64, 0x4e00001, u64::MAX, 0xa5a5a5a5a5a5a5a5] {
+        let mut steps = armed("echo; mw.b 0x1080000 0xa5 0x8");
+        steps.extend(armed("echo; store size data 0x1080000"));
+        steps.extend(armed("upload mem 0x1080000 normal 0x8"));
+        steps.extend([
+            Step::ControlIn(req::READ_MEDIA, 4096, 1, head(8)),
+            Step::BulkIn(size.to_le_bytes().to_vec()),
+        ]);
+        assert!(session(steps).partition_readable_size("data").is_err());
+    }
+}

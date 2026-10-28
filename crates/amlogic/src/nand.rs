@@ -24,6 +24,28 @@ pub fn raw_bytes(main_bytes: u32) -> Result<usize> {
 }
 
 impl<T: Transport> AmlogicSession<T> {
+    /// Logical store capacity excludes bad erase blocks. Only known partitions
+    /// are accepted, and the reported capacity cannot exceed their physical map.
+    pub fn partition_readable_size(&mut self, name: &str) -> Result<usize> {
+        let (_, _, physical) = crate::partition(name)
+            .ok_or_else(|| Error::InvalidArgument(format!("unknown partition {name:?}")))?;
+        self.bulk_cmd(&format!("echo; mw.b {RAM_SCRATCH:#x} 0xa5 0x8"))?;
+        self.bulk_cmd(&format!("echo; store size {name} {RAM_SCRATCH:#x}"))?;
+        let bytes = self.upload_read(RAM_SCRATCH, 8)?;
+        let size = u64::from_le_bytes(
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::InvalidResponse("short store size result".into()))?,
+        );
+        if size == 0 || size > physical as u64 || !size.is_multiple_of(PAGE_SIZE as u64) {
+            return Err(Error::InvalidResponse(format!(
+                "partition {name}: invalid logical size {size:#x} for physical {physical:#x}"
+            )));
+        }
+        Ok(size as usize)
+    }
+
     pub fn read_nand_chunk(&mut self, offset: u32, main_bytes: u32) -> Result<Vec<u8>> {
         self.stage_nand(offset, main_bytes, false)
     }

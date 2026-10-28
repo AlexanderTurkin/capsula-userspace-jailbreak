@@ -41,7 +41,10 @@ capsula-jb — quick start
    eight partitions, five reserved regions and nand-full.raw.bin
    (256 MiB NAND + OOB = 264 MiB). Each image uses one device pass;
    SHA256 checks saved files, without rereading NAND or RAM for comparison.
-   Check manifest.json: complete = full sizes; warnings = short partitions;
+   Partition sizes come from `store size` (bad blocks excluded).
+   Manifest: physical_size = mapped physical size, expected = readable logical
+   size, actual = saved bytes. Images are not padded to physical size.
+   Check manifest.json: complete = full logical sizes; warnings = short partitions;
    failed/running = unfinished. Short/interrupted files retain .partial.
    A new run starts a new directory. No restore command is provided.
    The default Amlogic scenario only identifies the board.
