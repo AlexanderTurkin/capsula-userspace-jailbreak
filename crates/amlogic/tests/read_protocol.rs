@@ -474,3 +474,23 @@ fn nand_range_failed_status_without_data_is_an_error() {
     assert!(error.to_string().contains("failed:"));
     assert_eq!(s.transport().pos, s.transport().steps.len());
 }
+
+/// Spec §14.1: the TPL command rides a fixed 64-byte zero-padded
+/// payload, not a variable-length string.
+#[test]
+fn tpl_command_is_a_zero_padded_64_byte_payload() {
+    let cmd = "download store data normal 0x100";
+    let mut s = session(vec![
+        Step::ControlOut(req::TPL_CMD, 0, 1, command(cmd)),
+        Step::ControlIn(req::TPL_STAT, 0, 0, b"success\0".to_vec()),
+    ]);
+    assert_eq!(s.tpl_cmd(cmd).unwrap(), "success");
+    assert_eq!(s.transport().pos, 2);
+}
+
+#[test]
+fn tpl_command_over_63_chars_is_refused_before_usb() {
+    let mut s = session(vec![]);
+    assert!(s.tpl_cmd(&"x".repeat(64)).is_err());
+    assert_eq!(s.transport().pos, 0);
+}

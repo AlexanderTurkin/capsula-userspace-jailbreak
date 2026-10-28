@@ -20,8 +20,6 @@ use usbcore::Transport;
 
 /// u16 block count per control transfer (pyamlboot MAX_LARGE_BLOCK_COUNT).
 const MAX_LARGE_BLOCKS: usize = 0xffff;
-/// Reply checksum algorithm id: add_sum (WRITE_MEDIA_CHEKSUM_ALG_ADDSUM).
-const CHECKSUM_ALG_ADDSUM: u16 = 0x00ef;
 /// Data block per `download` media packet (the burning tool's 64 KiB).
 pub const MEDIA_CHUNK: usize = 0x10000;
 /// Ack buffer length for media transfers (pyamlboot ackLen).
@@ -252,18 +250,19 @@ impl<T: Transport> AmlogicSession<T> {
     /// Large memory write (AM_REQ_WR_LARGE_MEM): one control transfer
     /// announces the transfer, the payload follows on the bulk-OUT pipe
     /// in `block_len` blocks (device-side cap 0x1000 per block). The
-    /// payload is zero-padded to a whole number of blocks.
+    /// last block MAY be shorter (§13.3); the header carries the actual
+    /// transfer length, its add_sum checksum and the block size.
     pub fn write_large_memory(&mut self, addr: u32, data: &[u8], block_len: usize) -> Result<()> {
         assert!((1..=0x1000).contains(&block_len), "block_len 1..0x1000");
-        let padded = data.len().div_ceil(block_len) * block_len;
-        let mut off = 0;
-        while off < padded {
-            let blocks = padded.div_ceil(block_len) - off / block_len;
-            let blocks = blocks.min(MAX_LARGE_BLOCKS);
-            let len = blocks * block_len;
+        let mut off = 0usize;
+        while off < data.len() {
+            let blocks = (data.len() - off).div_ceil(block_len).min(MAX_LARGE_BLOCKS);
+            let len = (data.len() - off).min(blocks * block_len);
             let mut head = [0u8; 16];
             head[0..4].copy_from_slice(&(addr + off as u32).to_le_bytes());
             head[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+            head[8..12].copy_from_slice(&(add_sum(&data[off..off + len]) & 0xffff).to_le_bytes());
+            head[12..16].copy_from_slice(&(block_len as u32).to_le_bytes());
             self.ctrl_out_timeout(
                 req::WR_LARGE_MEM,
                 block_len as u16,
@@ -274,11 +273,10 @@ impl<T: Transport> AmlogicSession<T> {
             for b in 0..blocks {
                 let start = off + b * block_len;
                 let end = (start + block_len).min(data.len());
-                let mut chunk = vec![0u8; block_len];
-                if start < end {
-                    chunk[..end - start].copy_from_slice(&data[start..end]);
+                if start >= end {
+                    break;
                 }
-                self.transport.bulk_write(self.ep_out, &chunk)?;
+                self.transport.bulk_write(self.ep_out, &data[start..end])?;
             }
             off += len;
         }
@@ -290,19 +288,19 @@ impl<T: Transport> AmlogicSession<T> {
     /// Reliable on the BootROM stage; the u-boot burning gadget of the
     /// old 2015.01 tree mishandles this request — there prefer
     /// [`AmlogicSession::upload_read`] (bulkcmd `upload mem`).
+    /// The length need not be a multiple of the block size (§13.2).
     pub fn read_large_memory(&mut self, addr: u32, buf: &mut [u8], block_len: usize) -> Result<()> {
         assert!((1..=0x1000).contains(&block_len), "block_len 1..0x1000");
-        if !buf.len().is_multiple_of(block_len) {
-            return Err(Error::Usb("length must be a multiple of block_len".into()));
-        }
-        let mut off = 0;
+        let mut off = 0usize;
         while off < buf.len() {
-            let blocks = (buf.len() - off) / block_len;
-            let blocks = blocks.min(MAX_LARGE_BLOCKS);
-            let len = blocks * block_len;
+            let blocks = (buf.len() - off).div_ceil(block_len).min(MAX_LARGE_BLOCKS);
+            let len = (buf.len() - off).min(blocks * block_len);
             let mut head = [0u8; 16];
             head[0..4].copy_from_slice(&(addr + off as u32).to_le_bytes());
             head[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+            // A read has no payload to checksum; the block size is the
+            // wValue mirror required by §13.1.
+            head[12..16].copy_from_slice(&(block_len as u32).to_le_bytes());
             self.ctrl_out_timeout(
                 req::RD_LARGE_MEM,
                 block_len as u16,
@@ -310,11 +308,8 @@ impl<T: Transport> AmlogicSession<T> {
                 &head,
                 LARGE_TIMEOUT,
             )?;
-            for b in 0..blocks {
-                let start = off + b * block_len;
-                self.transport
-                    .bulk_read(self.ep_in, &mut buf[start..start + block_len])?;
-            }
+            self.transport
+                .bulk_read(self.ep_in, &mut buf[off..off + len])?;
             off += len;
         }
         Ok(())
@@ -435,12 +430,12 @@ impl<T: Transport> AmlogicSession<T> {
         if cmd.as_bytes().contains(&0) {
             return Err(Error::InvalidArgument("command contains NUL".into()));
         }
-        let mut cmd = cmd.to_string();
-        cmd.push('\0');
-        if cmd.len() >= 128 {
-            return Err(Error::CommandTooLong(cmd));
+        let mut payload = [0u8; 64];
+        if cmd.len() + 1 > payload.len() {
+            return Err(Error::CommandTooLong(cmd.to_string()));
         }
-        self.ctrl_out_timeout(req::TPL_CMD, 0, 1, cmd.as_bytes(), TPL_CMD_TIMEOUT)?;
+        payload[..cmd.len()].copy_from_slice(cmd.as_bytes());
+        self.ctrl_out_timeout(req::TPL_CMD, 0, 1, &payload, TPL_CMD_TIMEOUT)?;
         self.tpl_stat()
     }
 
@@ -472,27 +467,43 @@ impl<T: Transport> AmlogicSession<T> {
     /// armed the transfer.
     pub fn write_media(&mut self, data: &[u8], seq: u32) -> Result<()> {
         assert!(data.len() <= MEDIA_CHUNK, "packet must be <= MEDIA_CHUNK");
-        let mut head = [0u8; 0x20];
-        head[0..4].copy_from_slice(&0u32.to_le_bytes()); // retryTimes / isPktResended
-        head[4..8].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        head[8..12].copy_from_slice(&seq.to_le_bytes());
-        head[12..16].copy_from_slice(&add_sum(data).to_le_bytes());
-        head[16..18].copy_from_slice(&CHECKSUM_ALG_ADDSUM.to_le_bytes());
-        head[18..20].copy_from_slice(&(MEDIA_ACK_LEN as u16).to_le_bytes());
-        self.ctrl_out_timeout(req::WRITE_MEDIA, 1, 0xffff, &head, MEDIA_TIMEOUT)?;
-        self.transport.bulk_write(self.ep_out, data)?;
-        loop {
-            let ack = self.read_bulk_reply()?;
-            if ack.starts_with("Continue:") {
-                log::info!("amlogic: {ack} — waiting");
-                sleep(MEDIA_CONTINUE_PAUSE);
-                continue;
-            }
-            if ack.starts_with("OK!!") {
-                return Ok(());
-            }
-            return Err(Error::MediaFailed(ack));
+        if data.is_empty() {
+            return Err(Error::InvalidArgument("empty media packet".into()));
         }
+        // Spec §16.2: attempt 0..2, block length, seq << 4, checksum,
+        // then `ef 00 00 01`, then zero padding. Retry a rejected block
+        // up to three times; `Continue:32` means "wait and read again".
+        let mut last = String::new();
+        for attempt in 0..3u32 {
+            let mut head = [0u8; 0x20];
+            head[0..4].copy_from_slice(&attempt.to_le_bytes());
+            head[4..8].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            head[8..12].copy_from_slice(&(seq << 4).to_le_bytes());
+            head[12..16].copy_from_slice(&add_sum(data).to_le_bytes());
+            head[16..20].copy_from_slice(&0x0100_00efu32.to_le_bytes());
+            self.ctrl_out_timeout(req::WRITE_MEDIA, 1, 0xffff, &head, MEDIA_TIMEOUT)?;
+            self.transport.bulk_write(self.ep_out, data)?;
+            loop {
+                let ack = self.read_bulk_reply()?;
+                if ack.starts_with("Continue:") {
+                    log::info!("amlogic: {ack} — waiting");
+                    sleep(MEDIA_CONTINUE_PAUSE);
+                    continue;
+                }
+                if ack.starts_with("OK!!") {
+                    return Ok(());
+                }
+                last = ack;
+                break;
+            }
+            if attempt < 2 {
+                log::warn!(
+                    "media block {seq} rejected ({last:?}); retrying (attempt {})",
+                    attempt + 1
+                );
+            }
+        }
+        Err(Error::MediaFailed(last))
     }
 
     /// Stream a whole buffer as `download` media packets of

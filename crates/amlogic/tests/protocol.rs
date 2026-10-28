@@ -112,27 +112,25 @@ fn run_wire_format() {
 /// 16-byte head [addr, len], then the payload on bulk OUT.
 #[test]
 fn write_large_memory_wire_format() {
-    let mut s = session(vec![
-        Step::ControlOut(req::WR_LARGE_MEM, 0x0200, 3, {
-            let mut h = [0u8; 16];
-            h[0..4].copy_from_slice(&0x01000000u32.to_le_bytes());
-            h[4..8].copy_from_slice(&0x0600u32.to_le_bytes());
-            h.to_vec()
-        }),
-        Step::BulkOut((0u32..0x200).map(|b| b as u8).collect()),
-        Step::BulkOut((0x200u32..0x400).map(|b| b as u8).collect()),
-        Step::BulkOut({
-            // the tail chunk is zero-padded to a whole block
-            let mut c = vec![0u8; 0x200];
-            c[0] = 0x55;
-            c
-        }),
-    ]);
     let data: Vec<u8> = (0u32..0x200)
         .chain(0x200u32..0x400)
         .map(|b| b as u8)
         .chain([0x55])
         .collect();
+    let mut s = session(vec![
+        Step::ControlOut(req::WR_LARGE_MEM, 0x0200, 3, {
+            let mut h = [0u8; 16];
+            h[0..4].copy_from_slice(&0x01000000u32.to_le_bytes());
+            h[4..8].copy_from_slice(&0x0401u32.to_le_bytes());
+            h[8..12].copy_from_slice(&(amlogic::add_sum(&data) & 0xffff).to_le_bytes());
+            h[12..16].copy_from_slice(&0x0200u32.to_le_bytes());
+            h.to_vec()
+        }),
+        Step::BulkOut(data[..0x200].to_vec()),
+        Step::BulkOut(data[0x200..0x400].to_vec()),
+        // the final block MAY be shorter (§13.3); no zero padding
+        Step::BulkOut(vec![0x55]),
+    ]);
     s.write_large_memory(0x01000000, &data, 0x200).unwrap();
     assert_eq!(s.transport().pos, 4);
 }
@@ -145,6 +143,7 @@ fn read_large_memory_wire_format() {
             let mut h = [0u8; 16];
             h[0..4].copy_from_slice(&0xd9000000u32.to_le_bytes());
             h[4..8].copy_from_slice(&0x0400u32.to_le_bytes());
+            h[12..16].copy_from_slice(&0x0200u32.to_le_bytes());
             h.to_vec()
         }),
         Step::BulkIn(vec![0x11; 0x200]),
@@ -154,6 +153,29 @@ fn read_large_memory_wire_format() {
     s.read_large_memory(0xd9000000, &mut buf, 0x200).unwrap();
     assert_eq!(&buf[..0x200], &vec![0x11; 0x200][..]);
     assert_eq!(&buf[0x200..], &vec![0x22; 0x200][..]);
+}
+
+/// §13.2: the length need not be a multiple of the block size; the last
+/// block is short.
+#[test]
+fn read_large_memory_accepts_a_short_final_block() {
+    let mut s = session(vec![
+        Step::ControlOut(req::RD_LARGE_MEM, 0x0200, 3, {
+            let mut h = [0u8; 16];
+            h[0..4].copy_from_slice(&0xd9000000u32.to_le_bytes());
+            h[4..8].copy_from_slice(&0x0401u32.to_le_bytes());
+            h[12..16].copy_from_slice(&0x0200u32.to_le_bytes());
+            h.to_vec()
+        }),
+        Step::BulkIn(vec![0x33; 0x200]),
+        Step::BulkIn(vec![0x44; 0x200]),
+        Step::BulkIn(vec![0x55]),
+    ]);
+    let mut buf = vec![0u8; 0x401];
+    s.read_large_memory(0xd9000000, &mut buf, 0x200).unwrap();
+    assert_eq!(&buf[..0x200], &vec![0x33; 0x200][..]);
+    assert_eq!(&buf[0x200..0x400], &vec![0x44; 0x200][..]);
+    assert_eq!(buf[0x400], 0x55);
 }
 
 /// bulkcmd: NUL-terminated string in the EP0 stage (wValue=0, wIndex=2),
@@ -196,53 +218,68 @@ fn bulk_cmd_too_long_rejected_before_the_bus() {
     assert_eq!(s.transport().pos, 0); // nothing was sent
 }
 
-/// Media write (download packet): 32-byte head (retry, len, seq, add_sum,
-/// alg 0x00ef, ack len 0x200), payload on bulk OUT, `OK!!` ack on bulk IN.
+/// Media write (download packet): 32-byte head with the spec §16.2
+/// layout — attempt, length, seq << 4, add_sum, `ef 00 00 01`, zeros.
+fn media_head(data: &[u8], seq: u32, attempt: u32) -> Vec<u8> {
+    let mut head = [0u8; 0x20];
+    head[0..4].copy_from_slice(&attempt.to_le_bytes());
+    head[4..8].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    head[8..12].copy_from_slice(&(seq << 4).to_le_bytes());
+    head[12..16].copy_from_slice(&amlogic::add_sum(data).to_le_bytes());
+    head[16..20].copy_from_slice(&0x0100_00efu32.to_le_bytes());
+    head.to_vec()
+}
+
+fn media_ack(text: &str) -> Vec<u8> {
+    let mut reply = vec![0u8; MEDIA_ACK_LEN];
+    reply[..text.len()].copy_from_slice(text.as_bytes());
+    reply
+}
+
 #[test]
 fn write_media_wire_format() {
     let data = vec![0x42u8; 512];
-    let sum = amlogic::add_sum(&data);
-    let mut head = [0u8; 0x20];
-    head[4..8].copy_from_slice(&512u32.to_le_bytes());
-    head[8..12].copy_from_slice(&7u32.to_le_bytes());
-    head[12..16].copy_from_slice(&sum.to_le_bytes());
-    head[16..18].copy_from_slice(&0x00efu16.to_le_bytes());
-    head[18..20].copy_from_slice(&(MEDIA_ACK_LEN as u16).to_le_bytes());
-
     let mut s = session(vec![
-        Step::ControlOut(req::WRITE_MEDIA, 1, 0xffff, head.to_vec()),
+        Step::ControlOut(req::WRITE_MEDIA, 1, 0xffff, media_head(&data, 7, 0)),
         Step::BulkOut(data.clone()),
-        Step::BulkIn({
-            let mut r = vec![0u8; MEDIA_ACK_LEN];
-            r[..4].copy_from_slice(b"OK!!");
-            r
-        }),
+        Step::BulkIn(media_ack("OK!!")),
     ]);
     s.write_media(&data, 7).unwrap();
     assert_eq!(s.transport().pos, 3);
 }
 
+/// A rejected block is retried with the attempt counter advanced, as
+/// the spec §16.2 requires (up to three attempts).
 #[test]
-fn write_media_rejects_error_ack() {
+fn write_media_retries_a_rejected_block() {
     let data = vec![1u8; 16];
-    let sum = amlogic::add_sum(&data);
-    let mut head = [0u8; 0x20];
-    head[4..8].copy_from_slice(&16u32.to_le_bytes());
-    head[12..16].copy_from_slice(&sum.to_le_bytes());
-    head[16..18].copy_from_slice(&0x00efu16.to_le_bytes());
-    head[18..20].copy_from_slice(&(MEDIA_ACK_LEN as u16).to_le_bytes());
-
     let mut s = session(vec![
-        Step::ControlOut(req::WRITE_MEDIA, 1, 0xffff, head.to_vec()),
-        Step::BulkOut(data),
-        Step::BulkIn({
-            let mut r = vec![0u8; MEDIA_ACK_LEN];
-            r[..15].copy_from_slice(b"0x: genSum 5 !=");
-            r
-        }),
+        Step::ControlOut(req::WRITE_MEDIA, 1, 0xffff, media_head(&data, 0, 0)),
+        Step::BulkOut(data.clone()),
+        Step::BulkIn(media_ack("0x: genSum 5 !=")),
+        Step::ControlOut(req::WRITE_MEDIA, 1, 0xffff, media_head(&data, 0, 1)),
+        Step::BulkOut(data.clone()),
+        Step::BulkIn(media_ack("OK!!")),
     ]);
-    let err = s.write_media(&[1u8; 16], 0).unwrap_err();
+    s.write_media(&data, 0).unwrap();
+    assert_eq!(s.transport().pos, 6);
+}
+
+#[test]
+fn write_media_rejects_after_three_attempts() {
+    let data = vec![1u8; 16];
+    let mut steps = Vec::new();
+    for attempt in 0..3 {
+        steps.extend([
+            Step::ControlOut(req::WRITE_MEDIA, 1, 0xffff, media_head(&data, 0, attempt)),
+            Step::BulkOut(data.clone()),
+            Step::BulkIn(media_ack("0x: genSum 5 !=")),
+        ]);
+    }
+    let mut s = session(steps);
+    let err = s.write_media(&data, 0).unwrap_err();
     assert!(err.to_string().contains("genSum"));
+    assert_eq!(s.transport().pos, 9);
 }
 
 /// Media streaming chunks a large buffer into MEDIA_CHUNK packets.
@@ -251,20 +288,14 @@ fn write_media_all_chunks() {
     let data = vec![0x77u8; MEDIA_CHUNK + 128];
     let mut steps = vec![];
     for (seq, part) in [(0u32, &data[..MEDIA_CHUNK]), (1u32, &data[MEDIA_CHUNK..])] {
-        let sum = amlogic::add_sum(part);
-        let mut head = [0u8; 0x20];
-        head[4..8].copy_from_slice(&(part.len() as u32).to_le_bytes());
-        head[8..12].copy_from_slice(&seq.to_le_bytes());
-        head[12..16].copy_from_slice(&sum.to_le_bytes());
-        head[16..18].copy_from_slice(&0x00efu16.to_le_bytes());
-        head[18..20].copy_from_slice(&(MEDIA_ACK_LEN as u16).to_le_bytes());
-        steps.push(Step::ControlOut(req::WRITE_MEDIA, 1, 0xffff, head.to_vec()));
+        steps.push(Step::ControlOut(
+            req::WRITE_MEDIA,
+            1,
+            0xffff,
+            media_head(part, seq, 0),
+        ));
         steps.push(Step::BulkOut(part.to_vec()));
-        steps.push(Step::BulkIn({
-            let mut r = vec![0u8; MEDIA_ACK_LEN];
-            r[..4].copy_from_slice(b"OK!!");
-            r
-        }));
+        steps.push(Step::BulkIn(media_ack("OK!!")));
     }
     let mut s = session(steps);
     s.write_media_all(&data).unwrap();
