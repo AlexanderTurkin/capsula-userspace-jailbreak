@@ -4,7 +4,8 @@
 
 use amlogic::req;
 use amlogic::session::{BULK_REPLY_LEN, MEDIA_ACK_LEN, MEDIA_CHUNK};
-use amlogic::{soc::Stage, AmlogicSession, SocId};
+use amlogic::{soc::Stage, AmlogicSession, Error, SocId};
+use std::time::Duration;
 use usbcore::mock::{MockTransport, Step};
 
 fn session(steps: Vec<Step>) -> AmlogicSession<MockTransport> {
@@ -561,4 +562,127 @@ fn bulk_cmd_short_reply_accepted() {
     ]);
     let status = s.bulk_cmd("low_power").unwrap();
     assert_eq!(status, "success");
+}
+
+/// The spec assigns a per-request deadline: identify 5 s, run and
+/// burning commands 50 s, TPL status 60 s.
+#[test]
+fn identify_uses_the_five_second_deadline() {
+    let mut s = session(vec![Step::ControlIn(
+        req::IDENTIFY_HOST,
+        0,
+        0,
+        vec![0, 7, 0, 16],
+    )]);
+    s.identify().unwrap();
+    assert_eq!(s.transport().last_timeout, Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn run_uses_the_fifty_second_deadline() {
+    let addr = 0x0100_8000u32;
+    let mut s = session(vec![Step::ControlOut(
+        req::RUN_IN_ADDR,
+        (addr >> 16) as u16,
+        addr as u16,
+        addr.to_le_bytes().to_vec(),
+    )]);
+    s.run(addr, false).unwrap();
+    assert_eq!(s.transport().last_timeout, Some(Duration::from_secs(50)));
+}
+
+#[test]
+fn bulk_command_uses_the_fifty_second_deadline() {
+    let mut s = session(vec![
+        Step::ControlOut(req::BULKCMD, 0, 2, bulkcmd("echo")),
+        Step::BulkIn(b"success\0".to_vec()),
+    ]);
+    s.bulk_cmd("echo").unwrap();
+    assert_eq!(s.transport().last_timeout, Some(Duration::from_secs(50)));
+}
+
+#[test]
+fn tpl_status_uses_the_sixty_second_deadline() {
+    let mut s = session(vec![Step::ControlIn(
+        req::TPL_STAT,
+        0,
+        0,
+        b"success\0".to_vec(),
+    )]);
+    s.tpl_stat().unwrap();
+    assert_eq!(s.transport().last_timeout, Some(Duration::from_secs(60)));
+}
+
+/// The prime must notice a dead bulk pipe quickly instead of burning
+/// the 50 s command window eight times.
+#[test]
+fn prime_uses_the_short_pipe_deadline() {
+    let mut s = session(vec![
+        Step::ControlOut(req::BULKCMD, 0, 2, bulkcmd("echo")),
+        Step::BulkIn(b"success\0".to_vec()),
+    ]);
+    s.prime().unwrap();
+    assert_eq!(s.transport().last_timeout, Some(Duration::from_secs(5)));
+}
+
+/// Password: wValue is the 16-bit sum of the bytes, wIndex 0, and the
+/// data phase carries the plaintext bytes (spec §10).
+#[test]
+fn password_wire_format() {
+    let password = b"secret";
+    let sum: u16 = password
+        .iter()
+        .fold(0u16, |sum, &byte| sum.wrapping_add(byte as u16));
+    let mut s = session(vec![Step::ControlOut(
+        req::PASSWORD,
+        sum,
+        0,
+        password.to_vec(),
+    )]);
+    s.send_password(password).unwrap();
+    assert_eq!(s.transport().pos, 1);
+    assert_eq!(s.transport().last_timeout, Some(Duration::from_secs(8)));
+}
+
+#[test]
+fn password_length_is_checked_before_usb() {
+    let mut s = session(vec![]);
+    assert!(s.send_password(&[]).is_err());
+    assert!(s.send_password(&[0u8; 65]).is_err());
+    assert_eq!(s.transport().pos, 0);
+}
+
+/// A TPL that still reports PWD_REQ=1 must not be sent the prime
+/// command; the caller needs to authenticate first.
+#[test]
+fn identify_and_prime_refuses_a_locked_tpl() {
+    let mut s = session(vec![Step::ControlIn(
+        req::IDENTIFY_HOST,
+        0,
+        0,
+        vec![0, 7, 0, 16, 1, 0, 0, 0],
+    )]);
+    assert!(matches!(
+        s.identify_and_prime(),
+        Err(Error::PasswordRequired)
+    ));
+    assert_eq!(s.transport().pos, 1);
+}
+
+/// PWD_REQ=1 with PWD_OK=1 is an already-authenticated session.
+#[test]
+fn identify_and_prime_accepts_an_authenticated_tpl() {
+    let mut steps = vec![Step::ControlIn(
+        req::IDENTIFY_HOST,
+        0,
+        0,
+        vec![0, 7, 0, 16, 1, 1, 0, 0],
+    )];
+    steps.extend([
+        Step::ControlOut(req::BULKCMD, 0, 2, bulkcmd("echo")),
+        Step::BulkIn(b"success\0".to_vec()),
+    ]);
+    let mut s = session(steps);
+    assert_eq!(s.identify_and_prime().unwrap().stage(), Stage::Tpl);
+    assert_eq!(s.transport().pos, 3);
 }

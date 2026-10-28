@@ -346,9 +346,11 @@ fn amlogic_scenario(wait: Option<Duration>) -> anyhow::Result<()> {
         amlogic::Stage::Tpl => {
             println!("u-boot burning gadget is answering (the vendor factory window).");
         }
-        amlogic::Stage::Ipl => {
-            println!("BootROM download mode (no password required).");
-        }
+        amlogic::Stage::Ipl => match soc.need_password() {
+            Some(true) => println!("BootROM download mode: password required (PWD_REQ=1)."),
+            Some(false) => println!("BootROM download mode (no password required)."),
+            None => println!("BootROM download mode (the reply carries no password flags)."),
+        },
         _ => {}
     }
     println!("The flashing scenario for the Amlogic mini is in development.");

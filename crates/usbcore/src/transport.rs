@@ -50,6 +50,42 @@ pub trait Transport {
     /// the first `transferred` bytes in `buf` are valid; keep the bytes
     /// and propagate the error rather than treating it as a short success.
     fn bulk_read_upto(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<usize>;
+
+    /// Timeout-aware control OUT. The default keeps third-party
+    /// transports source-compatible; production transports must honor
+    /// the protocol deadline.
+    fn control_out_timeout(
+        &mut self,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: &[u8],
+        _timeout: Duration,
+    ) -> Result<()> {
+        self.control_out(request, value, index, data)
+    }
+
+    /// Timeout-aware control IN. See [`Transport::control_out_timeout`].
+    fn control_in_timeout(
+        &mut self,
+        request: u8,
+        value: u16,
+        index: u16,
+        buf: &mut [u8],
+        _timeout: Duration,
+    ) -> Result<usize> {
+        self.control_in(request, value, index, buf)
+    }
+
+    /// Timeout-aware short bulk IN. See [`Transport::control_out_timeout`].
+    fn bulk_read_upto_timeout(
+        &mut self,
+        endpoint: u8,
+        buf: &mut [u8],
+        _timeout: Duration,
+    ) -> Result<usize> {
+        self.bulk_read_upto(endpoint, buf)
+    }
 }
 
 /// Transport over nusb (blocking IO via the MaybeFuture/EndpointRead/
@@ -162,6 +198,17 @@ impl NusbTransport {
 
 impl Transport for NusbTransport {
     fn control_out(&mut self, request: u8, value: u16, index: u16, data: &[u8]) -> Result<()> {
+        self.control_out_timeout(request, value, index, data, CONTROL_TIMEOUT)
+    }
+
+    fn control_out_timeout(
+        &mut self,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<()> {
         self.interface
             .control_out(
                 ControlOut {
@@ -172,13 +219,24 @@ impl Transport for NusbTransport {
                     index,
                     data,
                 },
-                CONTROL_TIMEOUT,
+                timeout,
             )
             .wait()?;
         Ok(())
     }
 
     fn control_in(&mut self, request: u8, value: u16, index: u16, buf: &mut [u8]) -> Result<usize> {
+        self.control_in_timeout(request, value, index, buf, CONTROL_TIMEOUT)
+    }
+
+    fn control_in_timeout(
+        &mut self,
+        request: u8,
+        value: u16,
+        index: u16,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> Result<usize> {
         let data = self
             .interface
             .control_in(
@@ -190,7 +248,7 @@ impl Transport for NusbTransport {
                     index,
                     length: buf.len() as u16,
                 },
-                CONTROL_TIMEOUT,
+                timeout,
             )
             .wait()?;
         let n = data.len().min(buf.len());
@@ -230,6 +288,15 @@ impl Transport for NusbTransport {
     }
 
     fn bulk_read_upto(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<usize> {
+        self.bulk_read_upto_timeout(endpoint, buf, BULK_TIMEOUT)
+    }
+
+    fn bulk_read_upto_timeout(
+        &mut self,
+        endpoint: u8,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> Result<usize> {
         let len = buf.len().min(BULK_IN_MAX);
         if len == 0 {
             return Ok(0);
@@ -252,7 +319,7 @@ impl Transport for NusbTransport {
         // bytes and status, with no internal resubmission on a ZLP.
         ep.submit(nusb::transfer::Buffer::new(request_len));
         let completion = ep
-            .wait_next_complete(BULK_TIMEOUT)
+            .wait_next_complete(timeout)
             .ok_or_else(|| Error::Usb("timeout waiting for bulk read".into()))?;
         // Dropping ep also cancels a pending request on timeout.
         complete_bulk_read(completion, buf)

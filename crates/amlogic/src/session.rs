@@ -40,10 +40,35 @@ pub const UPLOAD_SLOT: usize = 0x1_0000;
 /// much NAND->DRAM, then a single `upload mem` arm streams it to the
 /// host in device-paced bursts.
 pub const NAND_STAGE: usize = 256 * 1024;
-/// Pause between `Continue:` status polls (the reference flasher
-/// re-polls every 20 ms; 50 ms is still instant on the command scale).
+/// Pause between `Continue:32` media acknowledgements (spec §16.2).
+const MEDIA_CONTINUE_PAUSE: Duration = Duration::from_millis(500);
+/// Pause between `Continue:34` burning-command polls (spec §15.2).
+const COMMAND_CONTINUE_PAUSE: Duration = Duration::from_secs(3);
+/// Fallback pause for another `Continue:xx` code.
 const CONTINUE_PAUSE: Duration = Duration::from_millis(50);
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Overall status deadline; the spec gives a 60 s TPL status window.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+/// Identify is a 5 s request (spec §18).
+const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(5);
+/// EP0 memory read/write are 5 s requests (spec §18).
+const MEMORY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Run waits for the device-side memory handler (spec §18).
+const RUN_TIMEOUT: Duration = Duration::from_secs(50);
+/// Large memory transfers are 50 s requests (spec §18).
+const LARGE_TIMEOUT: Duration = Duration::from_secs(50);
+/// TPL command is a 50 s request (spec §18).
+const TPL_CMD_TIMEOUT: Duration = Duration::from_secs(50);
+/// TPL status is a 60 s request (spec §18).
+const TPL_STAT_TIMEOUT: Duration = Duration::from_secs(60);
+/// A burning command may run for 50 s before its first status (spec §18).
+const BULK_CMD_TIMEOUT: Duration = Duration::from_secs(50);
+/// Media read/write are 5 s requests (spec §18).
+const MEDIA_TIMEOUT: Duration = Duration::from_secs(5);
+/// One bulk status read after the command is already running: short
+/// enough to notice a dead pipe, long enough for a normal reply.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Password authentication is an 8 s request (spec §18).
+const PASSWORD_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// A session with an Amlogic SoC in a USB download mode.
 pub struct AmlogicSession<T: Transport> {
@@ -85,14 +110,42 @@ impl<T: Transport> AmlogicSession<T> {
         }
     }
 
-    /// EP0 vendor IN (control_in) helper.
+    /// EP0 vendor IN (control_in) helper with the 5 s memory timeout.
     fn ctrl_in(&mut self, request: u8, value: u16, index: u16, buf: &mut [u8]) -> Result<usize> {
-        Ok(self.transport.control_in(request, value, index, buf)?)
+        self.ctrl_in_timeout(request, value, index, buf, MEMORY_TIMEOUT)
     }
 
-    /// EP0 vendor OUT (control_out) helper.
+    /// EP0 vendor IN (control_in) with an operation-specific timeout.
+    fn ctrl_in_timeout(
+        &mut self,
+        request: u8,
+        value: u16,
+        index: u16,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> Result<usize> {
+        Ok(self
+            .transport
+            .control_in_timeout(request, value, index, buf, timeout)?)
+    }
+
+    /// EP0 vendor OUT (control_out) helper with the 5 s memory timeout.
     fn ctrl_out(&mut self, request: u8, value: u16, index: u16, data: &[u8]) -> Result<()> {
-        Ok(self.transport.control_out(request, value, index, data)?)
+        self.ctrl_out_timeout(request, value, index, data, MEMORY_TIMEOUT)
+    }
+
+    /// EP0 vendor OUT (control_out) with an operation-specific timeout.
+    fn ctrl_out_timeout(
+        &mut self,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<()> {
+        Ok(self
+            .transport
+            .control_out_timeout(request, value, index, data, timeout)?)
     }
 
     /// Identify the device (AM_REQ_IDENTIFY_HOST): protocol version and
@@ -100,7 +153,7 @@ impl<T: Transport> AmlogicSession<T> {
     /// its lifetime depends on the board's bootloader.
     pub fn identify(&mut self) -> Result<SocId> {
         let mut buf = [0u8; 8];
-        let n = self.ctrl_in(req::IDENTIFY_HOST, 0, 0, &mut buf)?;
+        let n = self.ctrl_in_timeout(req::IDENTIFY_HOST, 0, 0, &mut buf, IDENTIFY_TIMEOUT)?;
         if !(4..=buf.len()).contains(&n) || buf[..4].iter().all(|&b| b == 0) {
             return Err(Error::InvalidResponse(format!(
                 "invalid identify reply ({n} bytes)"
@@ -111,12 +164,34 @@ impl<T: Transport> AmlogicSession<T> {
     }
 
     /// Identify a session; only TPL supports the burning-command prime.
+    /// A device that still demands a password refuses the prime instead
+    /// of burning the window on commands it will reject.
     pub fn identify_and_prime(&mut self) -> Result<SocId> {
         let soc = self.identify()?;
         if soc.stage() == crate::Stage::Tpl {
+            if soc.need_password() == Some(true) && soc.password_ok() != Some(true) {
+                return Err(Error::PasswordRequired);
+            }
             self.prime()?;
         }
         Ok(soc)
+    }
+
+    /// Send the password (AM_REQ_PASSWORD): `wValue` is the 16-bit sum
+    /// of the bytes, `wIndex` is zero, the data is 1..64 bytes
+    /// (spec §10). The caller re-identifies and checks
+    /// [`SocId::password_ok`]; the vendor tool allows two attempts.
+    pub fn send_password(&mut self, password: &[u8]) -> Result<()> {
+        if password.is_empty() || password.len() > 64 {
+            return Err(Error::InvalidArgument(format!(
+                "password length {} outside 1..=64",
+                password.len()
+            )));
+        }
+        let sum = password
+            .iter()
+            .fold(0u16, |sum, &byte| sum.wrapping_add(byte as u16));
+        self.ctrl_out_timeout(req::PASSWORD, sum, 0, password, PASSWORD_TIMEOUT)
     }
 
     /// Write up to 64 bytes to memory (AM_REQ_WRITE_MEM).
@@ -165,11 +240,12 @@ impl<T: Transport> AmlogicSession<T> {
         } else {
             addr
         };
-        self.ctrl_out(
+        self.ctrl_out_timeout(
             req::RUN_IN_ADDR,
             (addr >> 16) as u16,
             addr as u16,
             &data.to_le_bytes(),
+            RUN_TIMEOUT,
         )
     }
 
@@ -188,7 +264,13 @@ impl<T: Transport> AmlogicSession<T> {
             let mut head = [0u8; 16];
             head[0..4].copy_from_slice(&(addr + off as u32).to_le_bytes());
             head[4..8].copy_from_slice(&(len as u32).to_le_bytes());
-            self.ctrl_out(req::WR_LARGE_MEM, block_len as u16, blocks as u16, &head)?;
+            self.ctrl_out_timeout(
+                req::WR_LARGE_MEM,
+                block_len as u16,
+                blocks as u16,
+                &head,
+                LARGE_TIMEOUT,
+            )?;
             for b in 0..blocks {
                 let start = off + b * block_len;
                 let end = (start + block_len).min(data.len());
@@ -221,7 +303,13 @@ impl<T: Transport> AmlogicSession<T> {
             let mut head = [0u8; 16];
             head[0..4].copy_from_slice(&(addr + off as u32).to_le_bytes());
             head[4..8].copy_from_slice(&(len as u32).to_le_bytes());
-            self.ctrl_out(req::RD_LARGE_MEM, block_len as u16, blocks as u16, &head)?;
+            self.ctrl_out_timeout(
+                req::RD_LARGE_MEM,
+                block_len as u16,
+                blocks as u16,
+                &head,
+                LARGE_TIMEOUT,
+            )?;
             for b in 0..blocks {
                 let start = off + b * block_len;
                 self.transport
@@ -239,8 +327,15 @@ impl<T: Transport> AmlogicSession<T> {
     /// still running (polled with a pause), anything else is the error
     /// text.
     pub fn bulk_cmd(&mut self, cmd: &str) -> Result<String> {
+        self.bulk_cmd_timeout(cmd, BULK_CMD_TIMEOUT)
+    }
+
+    /// [`bulk_cmd`](Self::bulk_cmd) with an explicit first-status
+    /// deadline; the prime needs the short pipe detector, not the 50 s
+    /// burning-command window.
+    fn bulk_cmd_timeout(&mut self, cmd: &str, first_status: Duration) -> Result<String> {
         self.send_bulk_cmd(cmd)?;
-        self.wait_bulk_status()
+        self.wait_bulk_status_timeout(first_status)
     }
 
     /// Send a bulk command without waiting for the status.
@@ -258,7 +353,7 @@ impl<T: Transport> AmlogicSession<T> {
         }
         let mut payload = [0u8; 64];
         payload[..cmd.len()].copy_from_slice(cmd.as_bytes());
-        self.ctrl_out(req::BULKCMD, 0, 2, &payload)
+        self.ctrl_out_timeout(req::BULKCMD, 0, 2, &payload, BULK_CMD_TIMEOUT)
     }
 
     /// Sacrificial command right after identify: the first bulkcmd of a
@@ -272,7 +367,7 @@ impl<T: Transport> AmlogicSession<T> {
     /// fails the whole run on a failed prime).
     pub fn prime(&mut self) -> Result<()> {
         for attempt in 0..8 {
-            match self.bulk_cmd("echo") {
+            match self.bulk_cmd_timeout("echo", MEMORY_TIMEOUT) {
                 // the pipe works — the reply text is meaningless here
                 Ok(_) | Err(Error::CommandFailed(_)) => return Ok(()),
                 Err(e @ Error::Usb(_)) => {
@@ -288,11 +383,25 @@ impl<T: Transport> AmlogicSession<T> {
     }
 
     /// Poll the bulk status until the running command finishes.
-    /// `Continue:xx` means "still executing". Polling stops after 30 s;
-    /// a transfer already in flight is bounded by the transport timeout.
+    /// `Continue:xx` means "still executing". A command may take up to
+    /// 50 s before its first status; later polls use the 5 s pipe
+    /// detector. The overall deadline is [`COMMAND_TIMEOUT`].
     pub fn wait_bulk_status(&mut self) -> Result<String> {
+        self.wait_bulk_status_timeout(BULK_CMD_TIMEOUT)
+    }
+
+    fn wait_bulk_status_timeout(&mut self, first_status: Duration) -> Result<String> {
         let start = Instant::now();
-        poll_status(|| self.read_bulk_reply(), || start.elapsed(), sleep)
+        let mut first = true;
+        poll_status(
+            || {
+                let timeout = if first { first_status } else { STATUS_TIMEOUT };
+                first = false;
+                self.read_bulk_reply_timeout(timeout)
+            },
+            || start.elapsed(),
+            sleep,
+        )
     }
 
     /// One 512-byte bulk-IN status reply, NUL-trimmed. Read UP TO 512 in
@@ -301,8 +410,14 @@ impl<T: Transport> AmlogicSession<T> {
     /// `Continue:34` tick) wedges the pipe — the exact session-killer
     /// of the earlier revisions.
     pub fn read_bulk_reply(&mut self) -> Result<String> {
+        self.read_bulk_reply_timeout(STATUS_TIMEOUT)
+    }
+
+    fn read_bulk_reply_timeout(&mut self, timeout: Duration) -> Result<String> {
         let mut buf = [0u8; BULK_REPLY_LEN];
-        let n = self.transport.bulk_read_upto(self.ep_in, &mut buf)?;
+        let n = self
+            .transport
+            .bulk_read_upto_timeout(self.ep_in, &mut buf, timeout)?;
         if n == 0 || n > buf.len() {
             return Err(Error::InvalidResponse(format!(
                 "invalid bulk status length: {n}"
@@ -325,18 +440,18 @@ impl<T: Transport> AmlogicSession<T> {
         if cmd.len() >= 128 {
             return Err(Error::CommandTooLong(cmd));
         }
-        self.ctrl_out(req::TPL_CMD, 0, 1, cmd.as_bytes())?;
+        self.ctrl_out_timeout(req::TPL_CMD, 0, 1, cmd.as_bytes(), TPL_CMD_TIMEOUT)?;
         self.tpl_stat()
     }
 
     /// Fetch the TPL command result (AM_REQ_TPL_STAT), polling within
-    /// the same 30-second status deadline as bulk commands.
+    /// the same 60-second status deadline as bulk commands.
     pub fn tpl_stat(&mut self) -> Result<String> {
         let start = Instant::now();
         poll_status(
             || {
                 let mut buf = [0u8; 0x40];
-                let n = self.ctrl_in(req::TPL_STAT, 0, 0, &mut buf)?;
+                let n = self.ctrl_in_timeout(req::TPL_STAT, 0, 0, &mut buf, TPL_STAT_TIMEOUT)?;
                 if n == 0 || n > buf.len() {
                     return Err(Error::InvalidResponse(format!(
                         "invalid TPL status length: {n}"
@@ -364,13 +479,13 @@ impl<T: Transport> AmlogicSession<T> {
         head[12..16].copy_from_slice(&add_sum(data).to_le_bytes());
         head[16..18].copy_from_slice(&CHECKSUM_ALG_ADDSUM.to_le_bytes());
         head[18..20].copy_from_slice(&(MEDIA_ACK_LEN as u16).to_le_bytes());
-        self.ctrl_out(req::WRITE_MEDIA, 1, 0xffff, &head)?;
+        self.ctrl_out_timeout(req::WRITE_MEDIA, 1, 0xffff, &head, MEDIA_TIMEOUT)?;
         self.transport.bulk_write(self.ep_out, data)?;
         loop {
             let ack = self.read_bulk_reply()?;
             if ack.starts_with("Continue:") {
                 log::info!("amlogic: {ack} — waiting");
-                sleep(CONTINUE_PAUSE);
+                sleep(MEDIA_CONTINUE_PAUSE);
                 continue;
             }
             if ack.starts_with("OK!!") {
@@ -424,7 +539,7 @@ impl<T: Transport> AmlogicSession<T> {
         let want = hint.clamp(1, UPLOAD_SLOT);
         let blocks = (want.div_ceil(0x1000)) as u16;
         let mut head = [0u8; 16];
-        let n = self.ctrl_in(req::READ_MEDIA, 0x1000, blocks, &mut head)?;
+        let n = self.ctrl_in_timeout(req::READ_MEDIA, 0x1000, blocks, &mut head, MEDIA_TIMEOUT)?;
         if n != 16 {
             return Err(Error::InvalidResponse(format!(
                 "short upload head: {n} of 16 bytes (session dead?)"
@@ -828,7 +943,14 @@ fn poll_status(
         }
         if text.starts_with("Continue:") {
             log::info!("amlogic: {text} — waiting");
-            pause(CONTINUE_PAUSE.min(COMMAND_TIMEOUT - spent));
+            let wait = if text.starts_with("Continue:32") {
+                MEDIA_CONTINUE_PAUSE
+            } else if text.starts_with("Continue:34") {
+                COMMAND_CONTINUE_PAUSE
+            } else {
+                CONTINUE_PAUSE
+            };
+            pause(wait.min(COMMAND_TIMEOUT - spent));
         } else if text.starts_with("success") {
             return Ok(text);
         } else {
@@ -849,7 +971,7 @@ mod tests {
         let result = poll_status(
             || {
                 reads.set(reads.get() + 1);
-                Ok(if elapsed.get() > Duration::from_secs(30) {
+                Ok(if elapsed.get() > Duration::from_secs(60) {
                     "success".into()
                 } else {
                     "Continue:34".into()
@@ -859,8 +981,8 @@ mod tests {
             |delay| elapsed.set(elapsed.get() + delay),
         );
         assert!(matches!(result, Err(Error::CommandTimeout)));
-        assert_eq!(elapsed.get(), Duration::from_secs(30));
-        assert_eq!(reads.get(), 600);
+        assert_eq!(elapsed.get(), Duration::from_secs(60));
+        assert_eq!(reads.get(), 20);
     }
 
     #[test]
@@ -868,7 +990,7 @@ mod tests {
         let elapsed = Cell::new(Duration::ZERO);
         let result = poll_status(
             || {
-                elapsed.set(Duration::from_secs(31));
+                elapsed.set(Duration::from_secs(61));
                 Ok("success".into())
             },
             || elapsed.get(),

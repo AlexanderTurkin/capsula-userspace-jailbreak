@@ -17,8 +17,11 @@ pub enum Error {
     InvalidResponse(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
-    #[error("command status did not finish within 30 seconds")]
+    #[error("command status did not finish within 60 seconds")]
     CommandTimeout,
+    /// The device reports `PWD_REQ=1` and has not accepted a password.
+    #[error("device requires a password before burning commands (PWD_REQ=1)")]
+    PasswordRequired,
     /// A bulk command (AM_REQ_BULKCMD / TPL command) was answered with an
     /// error text instead of `success`.
     #[error("device rejected the command: {0}")]

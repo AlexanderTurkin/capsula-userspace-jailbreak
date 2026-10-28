@@ -2,6 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::transport::Transport;
+use std::time::Duration;
 
 /// One expected scenario step: which control request or bulk transfer
 /// should happen and what to answer.
@@ -28,6 +29,8 @@ pub struct MockTransport {
     pub pos: usize,
     /// Log of every call, for test assertions.
     pub log: Vec<String>,
+    /// Deadline of the last timeout-aware call (protocol timing tests).
+    pub last_timeout: Option<Duration>,
 }
 
 impl MockTransport {
@@ -36,6 +39,7 @@ impl MockTransport {
             steps,
             pos: 0,
             log: Vec::new(),
+            last_timeout: None,
         }
     }
 
@@ -162,5 +166,38 @@ impl Transport for MockTransport {
             }
             other => Err(Error::Usb(format!("mock: expected data, got {other:?}"))),
         }
+    }
+    fn control_out_timeout(
+        &mut self,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<()> {
+        self.last_timeout = Some(timeout);
+        self.control_out(request, value, index, data)
+    }
+
+    fn control_in_timeout(
+        &mut self,
+        request: u8,
+        value: u16,
+        index: u16,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> Result<usize> {
+        self.last_timeout = Some(timeout);
+        self.control_in(request, value, index, buf)
+    }
+
+    fn bulk_read_upto_timeout(
+        &mut self,
+        endpoint: u8,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> Result<usize> {
+        self.last_timeout = Some(timeout);
+        self.bulk_read_upto(endpoint, buf)
     }
 }
