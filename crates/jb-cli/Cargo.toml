@@ -19,3 +19,5 @@ log = { workspace = true }
 env_logger = { workspace = true }
 clap = { workspace = true }
 indicatif = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

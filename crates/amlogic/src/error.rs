@@ -20,7 +20,7 @@ pub enum Error {
     #[error("media transfer failed: {0}")]
     MediaFailed(String),
     /// A command string is too long for the 128-byte EP0 buffer.
-    #[error("command too long (max 126 chars): {0}")]
+    #[error("command too long (max 63 chars): {0}")]
     CommandTooLong(String),
     /// I/O error.
     #[error("io: {0}")]

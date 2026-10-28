@@ -25,9 +25,10 @@ use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use jb_core::backup_store::BackupStore;
 use jb_core::config::Config;
-use jb_core::session::{bring_up, BringUpError, Progress};
+use jb_core::session::{bring_up, BringUpError, Progress, ProgressFn};
 use jb_core::target::{self, Target};
 use jb_core::{backup, flash, ota, userdata};
+use sha2::{Digest, Sha256};
 use rockusb::loader::RESET_SUBCODE_NORMAL;
 use rockusb::{LoaderContainer, NusbTransport};
 use std::path::{Path, PathBuf};
@@ -365,13 +366,12 @@ fn run_aml_env(wait: Option<Duration>) -> anyhow::Result<()> {
 
 /// `capsula-jb aml-dump <part>`: stream a vendor partition into backup/.
 ///
-/// The dump rides the `reboot update` window: the cold-boot window dies
-/// on a ~450 ms deadline nothing we send can cancel, but reboot-update
-/// runs `usb_burning=update 1000` with no auto-burn deadline at all.
-/// The first caught session jumps there; if a session still dies, the
-/// loop reboots back and continues from the checkpoint (adaptive: the
-/// per-session time budget grows while sessions survive, so a stable
-/// window ends up dumping without any reboots).
+/// The reference flasher's flow, verbatim: catch the download device,
+/// identify, prime, stream; on a session death catch the device again
+/// and continue from the checkpoint. Like the reference flasher, the
+/// partition is read TWICE and the SHA256 of both passes must match —
+/// the only real guarantee that the streaming did not corrupt or
+/// desynchronize anywhere along the way.
 fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
     println!(
         "Connect the Amlogic mini and power it on: the u-boot download \
@@ -379,37 +379,84 @@ fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
     );
     let p = progress::CliProgress::new();
     let progress = |ev: Progress| p.handle(ev);
-    let (mut s, _soc) = target::bring_up_amlogic(wait, &progress)?;
+    let (first, complete) = dump_pass(wait, part, "", &progress)?;
+    if !complete {
+        println!(
+            "done: backup/{part}.bin, {} (SHORT read: bad blocks — the received \
+             length is the truth; verification skipped) (nothing was written to \
+             the device)",
+            humansize(first.len() as u64)
+        );
+        return Ok(());
+    }
 
+    println!("verify pass: reading the partition again (double read)...");
+    let (second, complete2) = dump_pass(wait, part, ".verify", &progress)?;
+    if !complete2 {
+        bail!(
+            "verify pass came up short ({:#x} of {:#x}) — keeping backup/{part}.bin, \
+             rerun `aml-dump {part}` to verify",
+            second.len(),
+            first.len()
+        );
+    }
+    let h1 = Sha256::digest(&first);
+    let h2 = Sha256::digest(&second);
+    if h1 != h2 {
+        bail!(
+            "TWO READS DIFFER: {} vs {} — the partition content is unstable; \
+             do not trust backup/{part}.bin",
+            hex::encode(h1),
+            hex::encode(h2)
+        );
+    }
+    let _ = std::fs::remove_file(Path::new("backup").join(format!("{part}.verify.bin")));
+    println!(
+        "done: backup/{part}.bin, {} — verified by double read, SHA256 {} \
+         (nothing was written to the device)",
+        humansize(first.len() as u64),
+        hex::encode(h1)
+    );
+    Ok(())
+}
+
+/// One full dump pass over the reconnect cycle; `suffix` distinguishes
+/// the checkpoint file (the verify pass must not clobber the first pass
+/// result). Returns the data and whether the read ran to completion (a
+/// short read is a bad-block truncation, not a cycle boundary).
+///
+/// The flow is the reference flasher's, verbatim: catch the download
+/// device, identify, prime, then stream — and if the session dies,
+/// catch the device again and continue from the checkpoint. No window
+/// re-entry tricks, no port resets: on this u-boot every trick we tried
+/// either hangs on a dead pipe or boots the board into Linux, and a
+/// fresh download window is the one state we can always re-catch.
+fn dump_pass(
+    wait: Option<Duration>,
+    part: &str,
+    suffix: &str,
+    progress: ProgressFn,
+) -> anyhow::Result<(Vec<u8>, bool)> {
     let mut st = jb_core::aml::DumpState::new(part)?;
     progress(Progress::PartitionStart {
         name: part.into(),
         sectors: st.size as u64 / 512,
     });
 
-    // per-session budget: starts SAFE (300 ms) so the re-entry command
-    // below always goes out before the ~450-500 ms reaper, and grows
-    // for every session that survives its budget — an immortal window
-    // ends up never re-entering
-    let mut budget = Duration::from_millis(300);
-    let mut sessions_alive = 0u32;
+    const CHUNK: usize = 256 * 1024;
     // the same-offset failure budget: a persistent failure (not a mere
     // session death) after several reconnect attempts stops the dump
     let mut failures_at_offset = 0u32;
     let mut last_done = st.done();
-    const CHUNK: usize = 256 * 1024;
     const MAX_OFFSET_FAILURES: u32 = 5;
 
     loop {
+        let (mut s, _soc) = target::bring_up_amlogic(wait, progress)?;
         let t0 = std::time::Instant::now();
-        // the stop is polled between 32 KiB sub-chunks, so the session
-        // always exits with time to spare for the re-entry command
-        let stop = |t0: std::time::Instant| t0.elapsed() >= budget;
-        while st.done() < st.size && !st.short_read {
-            if stop(t0) {
-                break;
-            }
-            match jb_core::aml::dump_chunk_until(&mut s, &mut st, CHUNK, &progress, &|| stop(t0)) {
+        // stream until the session dies or the partition is done; the
+        // device announces every burst, the host just consumes
+        loop {
+            match jb_core::aml::dump_chunk_until(&mut s, &mut st, CHUNK, progress, &|| false) {
                 Ok(0) => break,
                 Ok(_) => {
                     if st.done() > last_done {
@@ -428,17 +475,6 @@ fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
         if st.done() >= st.size || st.short_read {
             break;
         }
-        if t0.elapsed() < budget {
-            // died before the budget: the window is NOT deadline-free
-            sessions_alive = 0;
-            budget = Duration::from_millis(300);
-        } else {
-            sessions_alive += 1;
-            if sessions_alive >= 2 {
-                budget = budget.saturating_mul(8);
-                sessions_alive = 0;
-            }
-        }
         failures_at_offset += 1;
         if failures_at_offset > MAX_OFFSET_FAILURES {
             bail!(
@@ -447,35 +483,41 @@ fn run_aml_dump(wait: Option<Duration>, part: &str) -> anyhow::Result<()> {
                 st.done()
             );
         }
-        // re-enter the download window FIRST (the session may be on the
-        // edge of the reaper), then checkpoint: the file write is
-        // host-side and can happen after the device is gone. If the
-        // session already died, this best-effort command is lost, the
-        // board continues into Linux, and bring_up below simply waits
-        // for the next power-up — power-cycle the speaker to resume.
-        jb_core::aml::reenter_download_window(&mut s);
+        let survived = t0.elapsed();
+        // checkpoint: the file write is host-side and can happen after
+        // the device is gone
         drop(s);
-        let _ = jb_core::aml::write_dump(Path::new("backup"), part, &st.data, &|_| {});
-        println!(
-            "dumped {} so far; re-entering the download window \
-             (power-cycle the speaker if it has booted into Linux)...",
-            humansize(st.done() as u64)
+        let _ = jb_core::aml::write_dump(
+            Path::new("backup"),
+            &format!("{part}{suffix}"),
+            &st.data,
+            &|_| {},
         );
-        let (ns, _soc) = target::bring_up_amlogic(wait, &progress)?;
-        s = ns;
+        println!(
+            "session closed after {} ({}, +{:#x} of {:#x}); catching the download \
+             window again — if nothing happens for ~15 s, power-cycle the speaker",
+            format_secs(survived),
+            humansize(st.done() as u64),
+            st.done(),
+            st.size
+        );
     }
 
-    jb_core::aml::write_dump(Path::new("backup"), part, &st.data, &progress)?;
+    jb_core::aml::write_dump(Path::new("backup"), &format!("{part}{suffix}"), &st.data, progress)?;
     let note = if st.short_read {
         " (short read: bad blocks — the received length is the truth)"
     } else {
         ""
     };
     println!(
-        "done: backup/{part}.bin, {}{note} (nothing was written to the device)",
+        "pass done: backup/{part}{suffix}.bin, {}{note}",
         humansize(st.done() as u64)
     );
-    Ok(())
+    Ok((st.data, !st.short_read))
+}
+
+fn format_secs(d: Duration) -> String {
+    format!("{:.1}s", d.as_secs_f32())
 }
 
 /// 16 bytes per row, with the address column.

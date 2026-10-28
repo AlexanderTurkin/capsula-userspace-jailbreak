@@ -131,6 +131,9 @@ pub fn bring_up_amlogic(
                     log::info!("usb: 1b8e:c003 gone (+{}ms)", start.elapsed().as_millis());
                     seen = false;
                 }
+                // the reference flasher polls at 10 ms; a busy spin here
+                // starves nothing but burns a core for minutes
+                std::thread::sleep(Duration::from_millis(10));
             }
             Err(e) => {
                 if !seen {
@@ -170,8 +173,12 @@ fn open_and_identify(
     std::thread::sleep(Duration::from_millis(50));
     let soc = s.identify()?;
     // The first bulkcmd of a session can lose its leading bytes
-    // (flasher.sh prime_bulk): sacrifice a command nobody needs.
-    s.prime();
+    // (flasher.sh prime_bulk): sacrifice a command nobody needs. A
+    // failure means a dead bulk pipe — continuing would burn the whole
+    // window on commands whose status nobody can read, so fail the
+    // attempt and let the caller reconnect (the reference flasher fails
+    // the run on a failed prime).
+    s.prime()?;
     log::info!("amlogic: open +{opened:?}, identify +{:?}", t.elapsed());
     progress(Progress::Step(format!("amlogic download device: {soc}")));
     Ok((s, soc))

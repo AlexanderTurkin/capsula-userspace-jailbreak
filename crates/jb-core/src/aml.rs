@@ -14,12 +14,12 @@ use std::path::Path;
 /// would carry the 0x55 wall of the BL2 memory test.
 pub fn capture_env<T: usbcore::Transport>(s: &mut AmlogicSession<T>) -> anyhow::Result<String> {
     s.bulk_cmd(&format!(
-        "mw.b {:#x} 0 {:#x}",
+        "echo; mw.b {:#x} 0 {:#x}",
         amlogic::ENV_ADDR,
         amlogic::ENV_SIZE
     ))
     .map_err(|e| anyhow::anyhow!("mw.b: {e}"))?;
-    s.bulk_cmd(&format!("env export -t {:#x}", amlogic::ENV_ADDR))
+    s.bulk_cmd(&format!("echo; env export -t {:#x}", amlogic::ENV_ADDR))
         .map_err(|e| anyhow::anyhow!("env export: {e}"))?;
     let buf = s
         .read_dram(amlogic::ENV_ADDR, amlogic::ENV_SIZE, &|_| {})

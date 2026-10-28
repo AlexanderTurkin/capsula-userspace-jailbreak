@@ -30,16 +30,18 @@ pub const BULK_REPLY_LEN: usize = 512;
 /// The device truncates a bulkcmd payload at 64 bytes silently; keep
 /// the string + NUL within that (flasher.sh BULKCMD_MAX = 63).
 pub const BULKCMD_MAX: usize = 63;
-/// Per-transfer size of the AM_REQ_READ_MEDIA pipe: wValue is 16-bit
-/// and the buffer-manager slots are small — 32 KiB is a safe step.
-pub const UPLOAD_CHUNK: usize = 0x8000;
+/// Device-side transfer slot of the upload stream (u-boot v2_burning
+/// `OPTIMUS_DOWNLOAD_SLOT_SZ`, 64 KiB): per AM_REQ_UPLOAD request the
+/// buffer manager announces `min(left of the armed command, this slot)`
+/// in the 16-byte EP0 head and pushes exactly that on bulk IN.
+pub const UPLOAD_SLOT: usize = 0x1_0000;
 /// NAND staging size of the raw-range dump: one `nand read` moves this
-/// much NAND->DRAM, then [`UPLOAD_CHUNK`] `upload mem` arms stream it
-/// to the host (fewer command round-trips per byte — the per-chunk
-/// cost is dominated by round-trips, not the bulk data).
+/// much NAND->DRAM, then a single `upload mem` arm streams it to the
+/// host in device-paced bursts.
 pub const NAND_STAGE: usize = 256 * 1024;
-/// Pause between `Continue:` status polls (as pyamlboot).
-const CONTINUE_PAUSE: Duration = Duration::from_secs(3);
+/// Pause between `Continue:` status polls (the reference flasher
+/// re-polls every 20 ms; 50 ms is still instant on the command scale).
+const CONTINUE_PAUSE: Duration = Duration::from_millis(50);
 
 /// A session with an Amlogic SoC in a USB download mode.
 pub struct AmlogicSession<T: Transport> {
@@ -230,36 +232,42 @@ impl<T: Transport> AmlogicSession<T> {
 
     /// Send a bulk command without waiting for the status.
     ///
-    /// Payload cap: the device truncates at 64 bytes silently and then
-    /// answers half a command with a syntax error nobody reports — so
-    /// anything longer is an error here (flasher.sh BULKCMD_MAX).
+    /// Wire format of the reference flasher: the command + NUL rides a
+    /// full 64-byte zero-padded payload, and the string itself is capped
+    /// at 63 chars (the device truncates at 64 silently and then
+    /// answers half a command with a syntax error nobody reports).
     pub fn send_bulk_cmd(&mut self, cmd: &str) -> Result<()> {
-        let mut cmd = cmd.to_string();
-        cmd.push('\0');
-        if cmd.len() > BULKCMD_MAX + 1 {
-            return Err(Error::CommandTooLong(cmd));
+        if cmd.len() > BULKCMD_MAX {
+            return Err(Error::CommandTooLong(cmd.to_string()));
         }
-        self.ctrl_out(req::BULKCMD, 0, 2, cmd.as_bytes())
+        let mut payload = [0u8; 64];
+        payload[..cmd.len()].copy_from_slice(cmd.as_bytes());
+        self.ctrl_out(req::BULKCMD, 0, 2, &payload)
     }
 
     /// Sacrificial command right after identify: the first bulkcmd of a
     /// session can lose its leading bytes (flasher.sh `prime_bulk`), and
     /// on a freshly caught device the bulk pipes may not be ready yet
-    /// (IOKit kIOUSBUnknownPipeErr) — so this also retries until the
-    /// bulk path answers. The semantic result is ignored either way.
-    pub fn prime(&mut self) {
-        for attempt in 0..3 {
+    /// (IOKit kIOUSBUnknownPipeErr) — so this retries until the bulk
+    /// path answers. The semantic result is ignored either way. A
+    /// failure here means the session is unusable: continuing would
+    /// burn the window on commands whose status nobody can read, so it
+    /// is an error and the caller reconnects (the reference flasher
+    /// fails the whole run on a failed prime).
+    pub fn prime(&mut self) -> Result<()> {
+        for attempt in 0..8 {
             match self.bulk_cmd("echo") {
                 // the pipe works — the reply text is meaningless here
-                Ok(_) | Err(Error::CommandFailed(_)) => return,
-                Err(_) => {
-                    if attempt == 2 {
-                        return;
+                Ok(_) | Err(Error::CommandFailed(_)) => return Ok(()),
+                Err(e) => {
+                    if attempt == 7 {
+                        return Err(e);
                     }
-                    sleep(Duration::from_millis(100));
+                    sleep(Duration::from_millis(50));
                 }
             }
         }
+        unreachable!()
     }
 
     /// Poll the bulk status until the running command finishes.
@@ -279,11 +287,19 @@ impl<T: Transport> AmlogicSession<T> {
         }
     }
 
-    /// One 512-byte bulk-IN status reply, NUL-trimmed.
+    /// One 512-byte bulk-IN status reply, NUL-trimmed. Read UP TO 512 in
+    /// one transfer: the reference flasher tolerates short replies, and
+    /// blocking for the full frame after a short packet (e.g. a
+    /// `Continue:34` tick) wedges the pipe — the exact session-killer
+    /// of the earlier revisions.
     pub fn read_bulk_reply(&mut self) -> Result<String> {
         let mut buf = [0u8; BULK_REPLY_LEN];
-        self.transport.bulk_read(self.ep_in, &mut buf)?;
-        Ok(nul_trim(&buf))
+        let n = self
+            .transport
+            .bulk_read_upto(self.ep_in, &mut buf)?;
+        let text = nul_trim(&buf[..n]);
+        log::debug!("amlogic: bulk reply {n}b: {text}");
+        Ok(text)
     }
 
     /// Execute a command via AM_REQ_TPL_CMD (subcode 1) and fetch the
@@ -359,86 +375,125 @@ impl<T: Transport> AmlogicSession<T> {
         Ok(())
     }
 
-    /// Receive `size` bytes uploaded by the preceding `upload ...`
-    /// burning command (AM_REQ_READ_MEDIA): a 16-byte EP0 header reply
-    /// followed by the payload on bulk-IN. `size` must fit 16 bits
-    /// (wValue); the burning tool uploads in 4 KiB steps.
-    pub fn read_media(&mut self, size: usize) -> Result<Vec<u8>> {
-        if size == 0 || size > 0xffff {
-            return Err(Error::Usb(format!("upload size {size} out of 1..=0xffff")));
-        }
-        let blocks = size.div_ceil(0x1000) as u16;
+    /// One AM_REQ_UPLOAD burst of the armed `upload ...` stream.
+    ///
+    /// Device side (usb_pcd.c `do_vendor_out_complete` AM_REQ_UPLOAD):
+    /// wValue/wIndex are IGNORED — the 16-byte EP0 head announces how
+    /// much the device pushes on bulk IN for THIS request:
+    /// `min(left of the armed command, UPLOAD_SLOT)`, and the gadget
+    /// streams exactly that much. The host must read exactly the
+    /// announced amount: reading less leaves the tail in the pipe and
+    /// every following burst drifts until the gadget stalls (the "pipe
+    /// overrun" of the pre-0.4 revisions), reading more stalls on
+    /// read_exact. `hint` only feeds the vendor tool's 4 KiB page
+    /// accounting in wIndex — wire fidelity, no effect on the device.
+    pub fn upload_fetch(&mut self, hint: usize) -> Result<(Vec<u8>, [u8; 16])> {
+        let want = hint.clamp(1, UPLOAD_SLOT);
+        let blocks = (want.div_ceil(0x1000)) as u16;
         let mut head = [0u8; 16];
-        self.ctrl_in(req::READ_MEDIA, size as u16, blocks, &mut head)?;
-        let mut data = vec![0u8; size];
-        self.transport.bulk_read(self.ep_in, &mut data)?;
-        Ok(data)
-    }
-
-    /// One AM_REQ_UPLOAD fetch that also returns the device state head:
-    /// bytes [4..8] are the data the device still owes, [8..12] the
-    /// sequence number (usb_pcd.c do_vendor_in_complete).
-    pub fn read_media_head(&mut self, size: usize) -> Result<(Vec<u8>, [u8; 16])> {
-        if size == 0 || size > 0xffff {
-            return Err(Error::Usb(format!("upload size {size} out of 1..=0xffff")));
+        let n = self.ctrl_in(req::READ_MEDIA, 0x1000, blocks, &mut head)?;
+        if n != 16 {
+            return Err(Error::Usb(format!(
+                "short upload head: {n} of 16 bytes (session dead?)"
+            )));
         }
-        let blocks = size.div_ceil(0x1000) as u16;
-        let mut head = [0u8; 16];
-        self.ctrl_in(req::READ_MEDIA, size as u16, blocks, &mut head)?;
-        let mut data = vec![0u8; size];
-        self.transport.bulk_read(self.ep_in, &mut data)?;
+        // [4..8] is what this burst will carry (do_vendor_in_complete
+        // copies it into bulk_data_len); a garbage head means a dead
+        // or desynchronized session.
+        let left = u32::from_le_bytes(head[4..8].try_into().unwrap()) as usize;
+        if left > UPLOAD_SLOT {
+            return Err(Error::Usb(format!(
+                "upload head announces {left:#x} bytes — beyond the device slot"
+            )));
+        }
+        let mut data = vec![0u8; left];
+        if left > 0 {
+            self.transport.bulk_read(self.ep_in, &mut data)?;
+        }
         Ok((data, head))
     }
 
+    /// Stream an armed `upload ...` command to completion: sequential
+    /// [`upload_fetch`](Self::upload_fetch) bursts until `total` bytes
+    /// are collected or the device announces an empty burst (the stream
+    /// ended early — bad blocks shorten NAND-backed uploads). Returns
+    /// what arrived; exact callers check the length themselves.
+    fn receive_upload(
+        &mut self,
+        total: usize,
+        stop: &dyn Fn() -> bool,
+        progress: &dyn Fn(usize),
+    ) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(total.min(1 << 20));
+        while out.len() < total {
+            if stop() {
+                break;
+            }
+            let (data, _head) = self.upload_fetch(total - out.len())?;
+            if data.is_empty() {
+                break;
+            }
+            out.extend_from_slice(&data);
+            progress(out.len());
+        }
+        Ok(out)
+    }
+
     /// u-boot gadget stage: read DRAM via the `upload mem <addr> normal
-    /// <size>` burning command + AM_REQ_READ_MEDIA (works around the old
-    /// tree's broken AM_REQ_RD_LARGE_MEM). `size` must fit 16 bits.
+    /// <size>` burning command + AM_REQ_UPLOAD bursts (works around the
+    /// old tree's broken AM_REQ_RD_LARGE_MEM). One arm for the whole
+    /// `size`, streamed in device-paced [`UPLOAD_SLOT`] bursts.
     pub fn upload_read(&mut self, addr: u32, size: usize) -> Result<Vec<u8>> {
+        if size == 0 || size > 0x80_0000 {
+            return Err(Error::Usb(format!("upload mem size {size:#x} out of 1..=0x800000")));
+        }
         let cmd = format!("upload mem {addr:#x} normal {size:#x}");
         self.send_bulk_cmd(&cmd)?;
         // the command completes once the payload is staged; the data
-        // itself arrives via read_media
+        // itself arrives via upload_fetch bursts
         let status = self.wait_bulk_status()?;
         log::debug!("upload armed: {status}");
-        self.read_media(size)
+        let out = self.receive_upload(size, &|| false, &|_| {})?;
+        if out.len() != size {
+            return Err(Error::Usb(format!(
+                "upload mem {addr:#x}: got {:#x} of {size:#x} bytes",
+                out.len()
+            )));
+        }
+        Ok(out)
     }
 
-    /// Read a large DRAM range in [`UPLOAD_CHUNK`] steps, each with its
-    /// own `upload mem` arm (independent transfers, no device-side
-    /// sequence to maintain).
+    /// Read a DRAM range (one `upload mem` arm + device-paced bursts).
     pub fn read_dram(
         &mut self,
         addr: u32,
         size: usize,
         progress: &dyn Fn(usize),
     ) -> Result<Vec<u8>> {
-        let mut out = vec![0u8; size];
-        let mut off = 0usize;
-        while off < size {
-            let n = (size - off).min(UPLOAD_CHUNK);
-            let chunk = self.upload_read(addr + off as u32, n)?;
-            out[off..off + n].copy_from_slice(&chunk);
-            off += n;
-            progress(off);
+        if size == 0 || size > 0x80_0000 {
+            return Err(Error::Usb(format!("upload mem size {size:#x} out of 1..=0x800000")));
         }
-        Ok(out)
+        self.send_bulk_cmd(&format!("upload mem {addr:#x} normal {size:#x}"))?;
+        let status = self.wait_bulk_status()?;
+        log::debug!("upload armed: {status}");
+        self.receive_upload(size, &|| false, progress)
     }
 
     /// `nand read <ram> <off> <len>` — raw-offset NAND read into DRAM
-    /// (the logical layout: u-boot skips bad blocks). Pair with
+    /// (the logical layout: u-boot skips bad blocks). Sent with the
+    /// reference flasher's `echo; ` prefix. Pair with
     /// [`AmlogicSession::read_dram`] to bring the data to the host.
     pub fn nand_read(&mut self, ram: u32, off: u32, len: usize) -> Result<()> {
-        self.bulk_cmd(&format!("nand read {ram:#x} {off:#x} {len:#x}"))
+        self.bulk_cmd(&format!("echo; nand read {ram:#x} {off:#x} {len:#x}"))
             .map(|_| ())
     }
 
     /// Dump a raw NAND range through DRAM (flasher.sh
     /// `read_big_from_flash`): a `nand read` stages up to
-    /// [`NAND_STAGE`] in RAM, `upload mem` streams it back in
-    /// [`UPLOAD_CHUNK`] steps. The one-shot `upload store` stream
-    /// overruns the pipe on this gadget (the device pushes the whole
-    /// armed size past the host read), so the per-chunk path is the
-    /// reliable one.
+    /// [`NAND_STAGE`] in RAM, then ONE `upload mem` arm streams the
+    /// stage to the host in device-paced bursts (the reference flasher's
+    /// mechanics: the device announces every burst in the upload head,
+    /// the host just consumes exactly what is announced).
     ///
     /// Error split: a `nand read` REJECTED by the device (`failed:`,
     /// a bad block after the good prefix) truncates the result and
@@ -455,8 +510,8 @@ impl<T: Transport> AmlogicSession<T> {
     }
 
     /// [`read_nand_range`] with a cooperative stop: `stop` is polled
-    /// before every sub-chunk, so a caller riding a short-lived window
-    /// can exit cleanly mid-range and finish the command it needs
+    /// before every burst, so a caller riding a short-lived window
+    /// can exit cleanly mid-stage and finish the command it needs
     /// before the window closes.
     pub fn read_nand_range_until(
         &mut self,
@@ -471,10 +526,14 @@ impl<T: Transport> AmlogicSession<T> {
             if stop() {
                 break;
             }
-            // identify doubles as the keepalive: one cheap control
-            // transfer per stage
-            let _ = self.identify();
             let stage = (len - total).min(NAND_STAGE);
+            // the `echo; ` prefix routes the command through the u-boot
+            // shell, exactly as the reference flasher sends it (the
+            // burning dispatcher must not intercept it)
+            self.bulk_cmd(&format!(
+                "echo; mw.b {:#x} 0xa5 {stage:#x}",
+                crate::RAM_SCRATCH
+            ))?;
             if let Err(e) = self.nand_read(crate::RAM_SCRATCH, off + total as u32, stage) {
                 match e {
                     // the device rejected the read after the good
@@ -492,20 +551,51 @@ impl<T: Transport> AmlogicSession<T> {
                     other => return Err(other),
                 }
             }
+            // arm the whole stage once; the bursts below are paced by
+            // the device (announced in the upload head)
+            self.send_bulk_cmd(&format!(
+                "upload mem {:#x} normal {stage:#x}",
+                crate::RAM_SCRATCH
+            ))?;
+            self.wait_bulk_status()?;
             let mut staged = 0usize;
             while staged < stage {
                 if stop() {
                     break;
                 }
-                let n = (stage - staged).min(UPLOAD_CHUNK);
-                let chunk = self.upload_read(crate::RAM_SCRATCH + staged as u32, n)?;
-                out[total + staged..total + staged + n].copy_from_slice(&chunk);
-                staged += n;
+                // pacing knob for the load-kill diagnosis: a pause
+                // between bursts tells apart a device-side FIFO overrun
+                // (death tracks the burst rate) from a hard device timer
+                // (death tracks wall time regardless of pacing)
+                if let Ok(ms) = std::env::var("AML_BURST_DELAY_MS") {
+                    if let Ok(ms) = ms.parse::<u64>() {
+                        if ms > 0 && staged > 0 {
+                            sleep(Duration::from_millis(ms));
+                        }
+                    }
+                }
+                let (chunk, _head) = self.upload_fetch(stage - staged)?;
+                if chunk.is_empty() {
+                    return Err(Error::Usb(format!(
+                        "upload mem: stream ended after {staged:#x} of {stage:#x} bytes"
+                    )));
+                }
+                out[total + staged..total + staged + chunk.len()].copy_from_slice(&chunk);
+                staged += chunk.len();
                 progress(total + staged);
             }
             total += staged;
             if staged < stage {
                 break; // stopped mid-stage
+            }
+            // the sentinel survived the read: the NAND did not replace
+            // the staging buffer (usb_pcd/flasher.sh guard)
+            if out[total - stage..total].iter().all(|&b| b == 0xa5) {
+                return Err(Error::Usb(format!(
+                    "nand read {:#x}: the staging buffer still holds the sentinel — \
+                     the read did not happen",
+                    off + (total - stage) as u32
+                )));
             }
         }
         out.truncate(total);
@@ -513,10 +603,12 @@ impl<T: Transport> AmlogicSession<T> {
     }
 
     /// Stream a whole partition by name: one `upload store <part>
-    /// normal <total>` arm, then sequential AM_REQ_UPLOAD fetches until
-    /// the device reports no data left. A short stream (bad blocks
-    /// shorten NAND reads) is returned with a warning, not an error —
-    /// the vendor flasher treats the received length as the truth.
+    /// normal <total>` arm, then sequential AM_REQ_UPLOAD bursts (the
+    /// device reads the NAND slot-by-slot itself and announces every
+    /// burst in the head). A short stream (bad blocks shorten NAND
+    /// reads, the device ends the stream with an empty burst) is
+    /// returned with a warning, not an error — the vendor flasher
+    /// treats the received length as the truth.
     pub fn upload_store(
         &mut self,
         part: &str,
@@ -528,31 +620,13 @@ impl<T: Transport> AmlogicSession<T> {
         }
         self.bulk_cmd(&format!("upload store {part} normal {total:#x}"))
             .map(|_| ())?;
-        let mut out = Vec::with_capacity(total);
-        while out.len() < total {
-            // 0x8000 steps: a ~64 KiB fetch breaks the pipe on real
-            // hardware (IOKit submit failure), 32 KiB is proven fine
-            let want = (total - out.len()).min(UPLOAD_CHUNK);
-            let (data, head) = self.read_media_head(want)?;
-            let left = u32::from_le_bytes(head[4..8].try_into().unwrap()) as usize;
-            if data.is_empty() {
-                return Err(Error::Usb(format!(
-                    "upload store {part}: stalled with {} of {total:#x} bytes",
-                    out.len()
-                )));
-            }
-            out.extend_from_slice(&data);
-            progress(out.len());
-            if left == 0 {
-                if out.len() < total {
-                    log::warn!(
-                        "upload store {part}: device reports no data left at {:#x} of {total:#x} \
-                         bytes (bad blocks shorten the read) — keeping the short dump",
-                        out.len()
-                    );
-                }
-                break;
-            }
+        let out = self.receive_upload(total, &|| false, progress)?;
+        if out.len() < total {
+            log::warn!(
+                "upload store {part}: stream ended at {:#x} of {total:#x} bytes \
+                 (bad blocks shorten the read) — keeping the short dump",
+                out.len()
+            );
         }
         Ok(out)
     }

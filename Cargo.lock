@@ -671,10 +671,12 @@ dependencies = [
  "anyhow",
  "clap",
  "env_logger",
+ "hex",
  "indicatif",
  "jb-core",
  "log",
  "rockusb",
+ "sha2",
 ]
 
 [[package]]

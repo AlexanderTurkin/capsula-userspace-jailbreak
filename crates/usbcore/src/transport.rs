@@ -12,6 +12,11 @@ use std::time::Duration;
 
 /// Timeout for control transfers.
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Timeout for one bulk transfer completion. Without it a bulk read on
+/// a device that vanished mid-command (the Amlogic gadget tears its USB
+/// stack down on re-init) hangs on IOKit forever — the reference
+/// flasher uses 5 s for bulk reads too.
+pub const BULK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Minimal synchronous transport needed by the vendor protocols.
 /// Production: [`NusbTransport`]; tests: [`crate::MockTransport`].
@@ -30,6 +35,13 @@ pub trait Transport {
     /// Read exactly buf.len() bytes from a bulk-IN endpoint (loop until
     /// full).
     fn bulk_read(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<()>;
+
+    /// Read UP TO buf.len() bytes from a bulk-IN endpoint: one transfer,
+    /// short packets included. Reply frames of the vendor protocols may
+    /// be shorter than the buffer (the reference flasher tolerates
+    /// short status reads); blocking for the full buffer would wedge
+    /// the pipe after a short reply.
+    fn bulk_read_upto(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<usize>;
 }
 
 /// Transport over nusb (blocking IO via the MaybeFuture/EndpointRead/
@@ -174,6 +186,7 @@ impl Transport for NusbTransport {
             .endpoint::<nusb::transfer::Bulk, nusb::transfer::Out>(endpoint)
             .map_err(|e| Error::Usb(e.to_string()))?;
         let mut writer = ep.writer(data.len().max(512));
+        writer.set_write_timeout(BULK_TIMEOUT);
         writer
             .write_all(data)
             .map_err(|e| Error::Usb(e.to_string()))?;
@@ -190,9 +203,23 @@ impl Transport for NusbTransport {
             .endpoint::<nusb::transfer::Bulk, nusb::transfer::In>(endpoint)
             .map_err(|e| Error::Usb(e.to_string()))?;
         let mut reader = ep.reader(buf.len().max(512));
+        reader.set_read_timeout(BULK_TIMEOUT);
         reader
             .read_exact(buf)
             .map_err(|e| Error::Usb(e.to_string()))?;
         Ok(())
+    }
+
+    fn bulk_read_upto(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<usize> {
+        let ep = self
+            .interface
+            .endpoint::<nusb::transfer::Bulk, nusb::transfer::In>(endpoint)
+            .map_err(|e| Error::Usb(e.to_string()))?;
+        let mut reader = ep.reader(buf.len().max(512));
+        reader.set_read_timeout(BULK_TIMEOUT);
+        // one transfer: a short packet ends it, and that IS the reply
+        reader
+            .read(buf)
+            .map_err(|e| Error::Usb(e.to_string()))
     }
 }
