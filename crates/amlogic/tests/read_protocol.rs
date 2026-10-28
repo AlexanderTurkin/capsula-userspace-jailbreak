@@ -300,3 +300,24 @@ fn upload_preserves_bytes_from_an_errored_completion_and_stops() {
         assert_eq!(s.transport().pos, 4);
     }
 }
+
+#[test]
+fn upload_empty_payload_error_identifies_stream_offset_and_announced_burst() {
+    let mut steps = armed("upload store bootloader normal 0x8");
+    steps.extend([
+        Step::ControlIn(req::READ_MEDIA, 4096, 1, head(4)),
+        Step::BulkIn(b"abcd".to_vec()),
+        Step::ControlIn(req::READ_MEDIA, 4096, 1, head(4)),
+        Step::BulkIn(vec![]),
+    ]);
+    let mut s = session(steps);
+    let mut out = Vec::new();
+    let error = s
+        .upload_store_to("bootloader", 8, &mut out, &|_| {})
+        .unwrap_err();
+    assert!(error.to_string().contains("stream offset 0x4"));
+    assert!(error.to_string().contains("announced 0x4"));
+    assert!(error.to_string().contains("head="));
+    assert_eq!(out, b"abcd");
+    assert_eq!(s.transport().pos, s.transport().steps.len());
+}

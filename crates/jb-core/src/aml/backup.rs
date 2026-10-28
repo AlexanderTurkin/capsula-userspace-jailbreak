@@ -187,8 +187,14 @@ fn capture(
             });
             // Sync the received prefix even when the USB operation failed.
             let synced = f.sync_all();
+            let saved = f
+                .metadata()
+                .map(|m| format!("{:#x}", m.len()))
+                .unwrap_or_else(|_| "unknown".into());
             drop(f);
-            let received = received?;
+            let received = received.with_context(|| {
+                format!("partition {name}: saved {saved} of {size:#x} bytes in {filename}.partial")
+            })?;
             synced?;
             record(&dir, &mut m, &filename, size as u64, received as u64)?;
             progress(Progress::TransferDone { name: name.into() });
@@ -474,7 +480,10 @@ mod tests {
         let parent = parent();
         let mut dev = Fake::new();
         dev.fail = true;
-        assert!(capture(&mut dev, parent.path(), &|_| {}, &layout()).is_err());
+        let error = capture(&mut dev, parent.path(), &|_| {}, &layout()).unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("partition boot"));
+        assert!(detail.contains("saved 0x3 of 0x8 bytes"));
         let dir = std::fs::read_dir(parent.path())
             .unwrap()
             .next()

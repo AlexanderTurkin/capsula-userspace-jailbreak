@@ -504,11 +504,17 @@ impl<T: Transport> AmlogicSession<T> {
             if stop() {
                 break;
             }
-            let (_, size) = self.upload_head(total - received, total - received)?;
+            let (head, size) = self.upload_head(total - received, total - received)?;
             if size == 0 {
                 break;
             }
-            self.read_upload_payload(size, out, &|n| progress(received + n))?;
+            self.read_upload_payload(size, out, &|n| progress(received + n))
+                .map_err(|error| match error {
+                    Error::InvalidResponse(detail) => Error::InvalidResponse(format!(
+                        "{detail}; stream offset {received:#x} (burst start), announced {size:#x}, total {total:#x}, head={head:02x?}"
+                    )),
+                    other => other,
+                })?;
             received += size;
         }
         Ok(received)
