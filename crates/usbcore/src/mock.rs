@@ -16,6 +16,8 @@ pub enum Step {
     BulkOut(Vec<u8>),
     /// Answer a bulk read with these bytes (exhaustion is an error).
     BulkIn(Vec<u8>),
+    /// Fail the next bulk read, simulating a USB disconnect or timeout.
+    BulkError(String),
 }
 
 #[derive(Default)]
@@ -117,6 +119,7 @@ impl Transport for MockTransport {
                     buf[filled..filled + data.len()].copy_from_slice(&data);
                     filled += data.len();
                 }
+                Step::BulkError(message) => return Err(Error::Usb(message)),
                 other => return Err(Error::Usb(format!("mock: expected data, got {other:?}"))),
             }
         }
@@ -134,6 +137,7 @@ impl Transport for MockTransport {
                 self.log.push(format!("in ep{endpoint:#x} {}b", data.len()));
                 Ok(data.len())
             }
+            Step::BulkError(message) => Err(Error::Usb(message)),
             other => Err(Error::Usb(format!("mock: expected data, got {other:?}"))),
         }
     }

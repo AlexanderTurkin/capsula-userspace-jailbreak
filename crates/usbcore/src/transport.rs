@@ -61,6 +61,16 @@ pub struct NusbTransport {
 }
 
 impl NusbTransport {
+    /// Open a device only when exactly one matching instance is present.
+    pub fn open_unique(vid: u16, pid: u16) -> Result<Self> {
+        let info = unique_device(
+            nusb::list_devices()
+                .wait()?
+                .filter(|d| d.vendor_id() == vid && d.product_id() == pid),
+        )?;
+        Self::open_device_info(&info)
+    }
+
     /// Open the first (vid, pid) device that passes `filter` (inspect
     /// strings/serials there to tell co-existing modes apart) and claim
     /// interface 0.
@@ -244,9 +254,34 @@ fn read_bulk_chunks(
     Ok(())
 }
 
+fn unique_device<T>(mut devices: impl Iterator<Item = T>) -> Result<T> {
+    let device = devices.next().ok_or(Error::DeviceNotFound)?;
+    if devices.next().is_some() {
+        return Err(Error::MultipleDevices);
+    }
+    Ok(device)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiple_devices_are_rejected_before_open() {
+        assert!(matches!(
+            unique_device([1, 2].into_iter()),
+            Err(Error::MultipleDevices)
+        ));
+    }
+
+    #[test]
+    fn one_device_is_selected_and_an_empty_bus_is_not_found() {
+        assert_eq!(unique_device([7].into_iter()).unwrap(), 7);
+        assert!(matches!(
+            unique_device(std::iter::empty::<u8>()),
+            Err(Error::DeviceNotFound)
+        ));
+    }
 
     #[test]
     fn bulk_in_splits_above_one_mib() {

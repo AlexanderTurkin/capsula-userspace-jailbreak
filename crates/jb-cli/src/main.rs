@@ -347,6 +347,18 @@ fn amlogic_scenario(wait: Option<Duration>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn require_aml_tpl(soc: &amlogic::SocId) -> anyhow::Result<()> {
+    if soc.stage() != amlogic::Stage::Tpl {
+        bail!(
+            "the device is in the {} stage — burning commands are only \
+             available from the u-boot gadget; power-cycle the speaker to \
+             catch its download window",
+            soc.stage().label()
+        );
+    }
+    Ok(())
+}
+
 /// `capsula-jb aml`: identify the Amlogic board / pass u-boot burning
 /// commands through the download mode. The whole batch runs within one
 /// caught window; `upload mem <addr> normal <size>` streams the memory
@@ -367,14 +379,7 @@ fn run_amlogic(wait: Option<Duration>, cmds: &[String]) -> anyhow::Result<()> {
     }
     // the burning-command dispatcher exists only in the u-boot gadget;
     // the BootROM does not answer AM_REQ_BULKCMD
-    if soc.stage() != amlogic::Stage::Tpl {
-        bail!(
-            "the device is in the {} stage — burning commands are only \
-             available from the u-boot gadget; power-cycle the speaker to \
-             catch its download window",
-            soc.stage().label()
-        );
-    }
+    require_aml_tpl(&soc)?;
     let t0 = std::time::Instant::now();
     for c in cmds {
         // "sleep <ms>": host-side pause, nothing is sent — for testing
@@ -446,7 +451,8 @@ fn run_aml_env(wait: Option<Duration>) -> anyhow::Result<()> {
     );
     let p = progress::CliProgress::new();
     let progress = |ev: Progress| p.handle(ev);
-    let (mut s, _soc) = target::bring_up_amlogic(wait, &progress)?;
+    let (mut s, soc) = target::bring_up_amlogic(wait, &progress)?;
+    require_aml_tpl(&soc)?;
     let env = jb_core::aml::capture_env(&mut s)?;
     println!("{env}");
     Ok(())
@@ -539,7 +545,8 @@ fn dump_pass(
     const MAX_OFFSET_FAILURES: u32 = 5;
 
     loop {
-        let (mut s, _soc) = target::bring_up_amlogic(wait, progress)?;
+        let (mut s, soc) = target::bring_up_amlogic(wait, progress)?;
+        require_aml_tpl(&soc)?;
         let t0 = std::time::Instant::now();
         // stream until the session dies or the partition is done; the
         // device announces every burst, the host just consumes
@@ -777,4 +784,21 @@ fn utc_now_iso() -> String {
     let mth = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if mth <= 2 { y + 1 } else { y };
     format!("{y:04}-{mth:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+#[cfg(test)]
+mod read_stage_tests {
+    use super::*;
+
+    #[test]
+    fn storage_commands_reject_bootrom_spl_and_unknown_stages() {
+        for stage in [0, 8, 5] {
+            let soc = amlogic::SocId::parse(&[0, 7, 0, stage]).unwrap();
+            assert!(require_aml_tpl(&soc).is_err());
+        }
+        for major in [0, 1] {
+            let soc = amlogic::SocId::parse(&[0, 7, major, 16]).unwrap();
+            assert!(require_aml_tpl(&soc).is_ok());
+        }
+    }
 }
