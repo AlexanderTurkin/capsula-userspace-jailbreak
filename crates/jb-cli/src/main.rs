@@ -61,31 +61,33 @@ enum Command {
     Backup,
     /// Live log of 2207:* USB events
     Monitor,
-    /// (internal) elevated WinUSB driver helper, spawned via UAC
-    #[command(name = win_drv::HELPER_ARG, hide = true)]
-    WinDrvHelper {
-        /// done-file path: the helper exits when it appears
-        done: PathBuf,
-    },
 }
 
 fn main() -> anyhow::Result<()> {
+    // An elevated relaunch (Windows UAC manifest) may start in
+    // C:\Windows\System32; the tool writes ota/backup/work relative to
+    // the CWD, so move next to the executable in that case.
+    if let Some(cwd) = win_drv::fix_cwd_if_system32() {
+        eprintln!("working directory: {}", cwd.display());
+    }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
-    if let Some(Command::WinDrvHelper { done }) = &cli.command {
-        std::process::exit(win_drv::helper_main(done));
-    }
     let wait = if cli.wait == 0 {
         None
     } else {
         Some(Duration::from_secs(cli.wait))
     };
-    match cli.command {
+    let result = match cli.command {
         None => run_jailbreak(wait, cli.yes, cli.format_userdata),
         Some(Command::Backup) => run_backup(wait),
         Some(Command::Monitor) => monitor(),
-        Some(Command::WinDrvHelper { .. }) => unreachable!("handled above"),
-    }
+    };
+    // Launched from a normal console, Windows elevates the tool into a
+    // NEW console window (see the UAC manifest note in .cargo/config.toml);
+    // keep that window open so the output is readable. A shared terminal
+    // or a redirected/none console gets no pause.
+    win_drv::pause_if_own_console();
+    result
 }
 
 fn print_step(ev: Progress) {
@@ -126,19 +128,11 @@ fn dump_all(
     drivers: &mut win_drv::Session,
 ) -> anyhow::Result<rockusb::LoaderSession<NusbTransport>> {
     if win_drv::any_rockchip_node_misbound() {
-        println!("a Rockchip device is present without WinUSB — installing the driver (accept the UAC prompt)");
-        if let Err(e) = drivers.ensure_supervision() {
-            println!(
-                "warning: {e}; continuing, but a manual Zadig pass may be needed\n\
-                 (see DRIVER-SETUP.txt; session log: {})",
-                drivers.log_path().display()
-            );
-        } else if !win_drv::wait_until_bound(Duration::from_secs(30)) {
-            println!("warning: the driver did not settle in 30 s; continuing anyway");
-        }
+        println!("a Rockchip device is present without WinUSB — installing the driver");
+        start_or_wait_drivers(drivers, Duration::from_secs(180));
     }
 
-    const ATTEMPTS: u32 = 4;
+    const ATTEMPTS: u32 = 5;
     for attempt in 1..=ATTEMPTS {
         match dump_all_once(wait) {
             Ok(s) => return Ok(s),
@@ -147,17 +141,52 @@ fn dump_all(
                     println!(
                         "device node caught a non-WinUSB driver (attempt {attempt}/{ATTEMPTS}) — rebinding and retrying"
                     );
-                    if let Err(e2) = drivers.ensure_supervision() {
-                        println!("warning: {e2}");
-                    }
-                    std::thread::sleep(Duration::from_secs(2));
+                    start_or_wait_drivers(drivers, Duration::from_secs(120));
                     continue;
+                }
+                if win_drv::chain_is_binding_error(&e) {
+                    // the driver supervisor could not win in ATTEMPTS tries
+                    return Err(e.context(format!(
+                        "the WinUSB driver did not settle; session log: {}\n\
+                         manual fallback: see DRIVER-SETUP.txt (Zadig)",
+                        drivers.log_path().display()
+                    )));
                 }
                 return Err(e);
             }
         }
     }
     unreachable!("the retry loop always returns")
+}
+
+/// Make sure the driver supervisor is running, then wait for the board
+/// to actually settle on WinUSB. The process is elevated from the very
+/// start (UAC manifest), so this is pure install time: certificates,
+/// the driver package import and the devnode restart take a few seconds
+/// on a first run.
+fn start_or_wait_drivers(drivers: &mut win_drv::Session, settle: Duration) {
+    match drivers.ensure_supervision() {
+        Ok(()) => {
+            println!(
+                "installing the WinUSB driver if needed (up to {} s)...",
+                settle.as_secs()
+            );
+            if !win_drv::wait_until_bound(settle) {
+                println!(
+                    "warning: the driver did not settle in {} s (session log: {})",
+                    settle.as_secs(),
+                    drivers.log_path().display()
+                );
+            }
+        }
+        Err(e) => {
+            println!(
+                "warning: {e}\n  manual fallback: see DRIVER-SETUP.txt (Zadig)\n  \
+                 session log: {}",
+                drivers.log_path().display()
+            );
+        }
+    }
 }
 
 /// One bring-up + dump attempt (no retries).

@@ -36,16 +36,21 @@
 
 ## win-drv (Windows-драйверы)
 
-Крейт `crates/win-drv` держит плату на WinUSB без ручного Zadig:
-пакеты зашиты в бинарник, сертификаты ставятся в ROOT/TrustedPublisher,
-привязка — `UpdateDriverForPlugAndPlayDevices` с FORCE (тот же newdev
-API, что у Zadig), сессия следит за шиной и перевязывает узлы,
-перехваченные вендорским Rockusb. Из непривилегированного процесса
-работает скрытая подкоманда-хелпер (`capsula-jb __win-drv-helper`),
-поднимаемая через UAC; из повышенного — инлайн-поток. Живой тест:
-удалить libwdi-пакеты (`pnputil /delete-driver oemNN.inf /uninstall
-/force`), вернуть вендорский, запустить `capsula-jb backup` —
-сценарий должен сам дойти до «reading GPT».
+Крейт `crates/win-drv` держит плату на WinUSB без ручного Zadig: пакеты
+зашиты в бинарник, сертификаты ставятся в **машинные**
+Root/TrustedPublisher (`CertOpenStore(CERT_SYSTEM_STORE_LOCAL_MACHINE)`;
+`CertOpenSystemStore` здесь ошибка — он пишет в хранилища текущего
+пользователя и вешает процесс на модальном диалоге Windows), привязка —
+`UpdateDriverForPlugAndPlayDevices` с FORCE (тот же newdev API, что у
+Zadig), сессия следит за шиной и перевязывает узлы, перехваченные
+вендорским Rockusb. Повышение — манифестом requireAdministrator,
+вшитым ресурсом через `embed-resource` в jb-cli (путь через
+`/MANIFESTUAC` в rustflags не работает — link.exe не принимает его в
+этой форме). Живой тест: удалить libwdi-пакеты (`pnputil
+/delete-driver oemNN.inf /uninstall /force`) и сертификаты (`certutil
+-delstore Root/TrustedPublisher <thumbprint>`), запустить
+`capsula-jb backup` из непривилегированного контекста — сценарий должен
+сам дойти до «reading GPT» и полного дампа.
 
 ## adbd
 

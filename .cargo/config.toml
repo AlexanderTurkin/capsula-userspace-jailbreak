@@ -9,5 +9,7 @@
 rustflags = ["-C", "link-arg=/STACK:8388608"]
 
 # Kept for completeness in case a GNU-target build is ever produced.
+# The GNU toolchain embeds manifests differently (windres resource), so
+# the UAC requirement would have to be added there explicitly.
 [target.x86_64-pc-windows-gnu]
 rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]

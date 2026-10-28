@@ -1,6 +1,6 @@
 //! Non-Windows stub: USB needs no driver binding on macOS/Linux.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct Session;
 
@@ -25,6 +25,8 @@ impl Session {
     }
 }
 
-pub fn helper_main(_done: &Path) -> i32 {
-    0
+pub fn pause_if_own_console() {}
+
+pub fn fix_cwd_if_system32() -> Option<PathBuf> {
+    None
 }

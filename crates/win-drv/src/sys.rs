@@ -13,18 +13,17 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
 };
 use windows_sys::Win32::Foundation::{GetLastError, MAX_PATH};
 use windows_sys::Win32::Security::Cryptography::{
-    CertAddEncodedCertificateToStore, CertCloseStore, CertOpenSystemStoreW,
-    CERT_STORE_ADD_USE_EXISTING, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+    CertAddEncodedCertificateToStore, CertCloseStore, CertOpenStore, CERT_STORE_ADD_USE_EXISTING,
+    CERT_STORE_NO_CRYPT_RELEASE_FLAG, CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_LOCAL_MACHINE,
+    PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
 };
-use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteExW, SHELLEXECUTEINFOW};
-use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+use windows_sys::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
+use windows_sys::Win32::UI::Shell::IsUserAnAdmin;
 
 /// `UpdateDriverForPlugAndPlayDevices`: install even if the current
 /// driver looks "better" — this is what wins the ranking war against
 /// the vendor Rockusb package on freshly created devnodes.
 const INSTALLFLAG_FORCE: u32 = 0x0000_0001;
-const SEE_MASK_NOCLOSEPROCESS: u32 = 0x0000_0040;
-const SEE_MASK_FLAG_NO_UI: u32 = 0x0000_0400;
 
 /// How often the supervisor re-checks devnode bindings.
 const POLL: Duration = Duration::from_millis(500);
@@ -160,15 +159,26 @@ pub fn materialize(pkg: &Package, dir: &Path) -> std::io::Result<PathBuf> {
     Ok(dir.join(pkg.inf_name))
 }
 
-/// Install the self-signed signer certificate into the machine ROOT
-/// and TrustedPublisher stores so the catalog signature validates.
+/// Install the self-signed signer certificate into the LOCAL MACHINE
+/// Root and TrustedPublisher stores so the catalog signature validates
+/// for the driver installation. Machine stores are opened explicitly:
+/// `CertOpenSystemStore` maps to the CURRENT USER stores, where a Root
+/// add from an interactive process pops a modal Windows confirmation
+/// dialog (and the wrong store scope for driver validation anyway).
 pub fn install_cert(cer: &[u8]) -> Result<(), String> {
     unsafe {
-        for name in ["ROOT", "TrustedPublisher"] {
-            let store = CertOpenSystemStoreW(0, wide(name).as_ptr());
+        for name in ["Root", "TrustedPublisher"] {
+            let name_w = wide(name);
+            let store = CertOpenStore(
+                CERT_STORE_PROV_SYSTEM_W,
+                0,
+                0,
+                CERT_STORE_NO_CRYPT_RELEASE_FLAG | CERT_SYSTEM_STORE_LOCAL_MACHINE,
+                name_w.as_ptr().cast(),
+            );
             if store.is_null() {
                 return Err(format!(
-                    "CertOpenSystemStore({name}) failed: {}",
+                    "CertOpenStore({name}, machine) failed: {}",
                     GetLastError()
                 ));
             }
@@ -186,7 +196,7 @@ pub fn install_cert(cer: &[u8]) -> Result<(), String> {
                 // "object already exists" is the normal second-run path
                 // (CRYPT_E_EXISTS = 0x80092005); anything else is real.
                 return Err(format!(
-                    "CertAddEncodedCertificateToStore({name}) failed: {err}"
+                    "CertAddEncodedCertificateToStore({name}, machine) failed: {err}"
                 ));
             }
         }
@@ -310,7 +320,11 @@ fn rebind_pass(dir: &Path, log: &Path, rb: &mut Rebindings) -> Vec<String> {
 
 /// The supervisor loop: one immediate pass, then keep watching while
 /// the parent session lives (the done file appears on its drop).
+/// The `ready` sibling of `done` appears once the initial install pass
+/// has completed; `hb` is touched periodically as a liveness signal.
 fn supervise(dir: &Path, done: &Path, log: &Path) {
+    let ready = done.with_extension("ready");
+    let hb = done.with_extension("hb");
     // Certificates first: without them the first force_bind on a fresh
     // machine would fail signature validation.
     for pkg in PACKAGES {
@@ -320,31 +334,26 @@ fn supervise(dir: &Path, done: &Path, log: &Path) {
     }
     let mut rb = Rebindings::default();
     rebind_pass(dir, log, &mut rb);
+    let _ = std::fs::write(&ready, b"ready");
+    log_line(log, "initial driver pass complete (ready)");
     let start = Instant::now();
+    let mut last_hb = Instant::now();
     while !done.exists() && start.elapsed() < HELPER_TTL {
         if rockchip_nodes().iter().any(|n| !n.bound_ok()) {
             rebind_pass(dir, log, &mut rb);
+        }
+        if last_hb.elapsed() >= Duration::from_secs(2) {
+            let _ = std::fs::write(&hb, b"hb");
+            last_hb = Instant::now();
         }
         std::thread::sleep(POLL);
     }
 }
 
-/// Entry point of the elevated helper process (hidden CLI subcommand).
-pub fn helper_main(done: &Path) -> i32 {
-    let dir = done
-        .parent()
-        .map(|p| p.join("pkg"))
-        .unwrap_or_else(|| std::env::temp_dir().join("capsula-jb-winusb-helper"));
-    let log = done.with_extension("log");
-    log_line(&log, "helper started");
-    supervise(&dir, done, &log);
-    log_line(&log, "helper done");
-    0
-}
-
-/// Driver supervision session: starts the supervisor lazily (elevated
-/// helper process via UAC, or an inline thread when already elevated)
-/// and signals it to stop on drop.
+/// Driver supervision session. The process itself is elevated (the
+/// Windows build requires it in its UAC manifest), so the supervisor
+/// is just a background thread that keeps Rockchip devnodes on WinUSB
+/// for the lifetime of the run; it stops when the Session drops.
 pub struct Session {
     done: PathBuf,
     log: PathBuf,
@@ -374,60 +383,75 @@ impl Session {
         &self.log
     }
 
-    /// True when the parent is elevated: the supervisor runs inline,
-    /// no UAC is needed.
-    pub fn elevated(&self) -> bool {
-        unsafe { IsUserAnAdmin() != 0 }
-    }
-
-    /// Start supervision (idempotent). Spawns the elevated helper via
-    /// UAC unless the process itself is elevated.
+    /// Start supervision (idempotent).
     pub fn ensure_supervision(&mut self) -> anyhow::Result<()> {
         if self.started {
             return Ok(());
         }
-        std::fs::create_dir_all(&self.dir)?;
-        if self.elevated() {
-            let dir = self.dir.clone();
-            let done = self.done.clone();
-            let log = self.log.clone();
-            std::thread::spawn(move || supervise(&dir, &done, &log));
-            log_line(&self.log, "inline supervisor started (process is elevated)");
-        } else {
-            self.spawn_helper()?;
-            log_line(&self.log, "elevated helper spawned");
+        if !self.elevated() {
+            anyhow::bail!(
+                "process is not elevated: the Windows build requires an \
+                 administrator console (UAC manifest)"
+            );
         }
+        std::fs::create_dir_all(&self.dir)?;
+        let dir = self.dir.clone();
+        let done = self.done.clone();
+        let log = self.log.clone();
+        std::thread::spawn(move || supervise(&dir, &done, &log));
+        log_line(&self.log, "inline supervisor started");
         self.started = true;
         Ok(())
     }
 
-    fn spawn_helper(&self) -> anyhow::Result<()> {
-        let exe = std::env::current_exe()?;
-        let params = format!("{} \"{}\"", crate::HELPER_ARG, self.done.display());
-        let verb = wide("runas");
-        let file = wide(&exe.to_string_lossy());
-        let params_w = wide(&params);
-        let mut sei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
-        sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-        sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
-        sei.lpVerb = verb.as_ptr();
-        sei.lpFile = file.as_ptr();
-        sei.lpParameters = params_w.as_ptr();
-        sei.nShow = SW_HIDE;
-        let ok = unsafe { ShellExecuteExW(&mut sei) };
-        if ok == 0 {
-            anyhow::bail!(
-                "could not start the elevated driver helper (UAC declined?): {}",
-                unsafe { GetLastError() }
-            );
-        }
-        Ok(())
+    /// True when the process runs with administrator rights.
+    pub fn elevated(&self) -> bool {
+        unsafe { IsUserAnAdmin() != 0 }
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // signals both the helper process and the inline thread
         let _ = std::fs::write(&self.done, b"done");
     }
+}
+
+/// Pause before exit when this console window was created for the
+/// process alone — what happens when an unelevated console (or
+/// Explorer) launches the tool and Windows elevates it into a NEW
+/// console: without a pause the window (and all the output) would
+/// vanish with the process. A shared terminal (two or more attached
+/// processes) or no console at all gets no pause.
+pub fn pause_if_own_console() {
+    use std::io::{BufRead, Write};
+    unsafe {
+        if GetConsoleWindow().is_null() {
+            return;
+        }
+        let mut procs = [0u32; 16];
+        let n = GetConsoleProcessList(procs.as_mut_ptr(), 16);
+        if n != 1 {
+            return;
+        }
+    }
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "\npress Enter to close this window...");
+    let _ = out.flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+}
+
+/// An elevated relaunch may start with CWD = C:\Windows\System32 (the
+/// elevation broker's default); the tool writes ota/backup/work
+/// relative to the CWD, so move to the executable's directory in that
+/// case. Returns the new CWD when it was changed.
+pub fn fix_cwd_if_system32() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let cwd_s = cwd.to_string_lossy().to_lowercase();
+    if !cwd_s.contains("\\windows\\system32") {
+        return None;
+    }
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    std::env::set_current_dir(&exe_dir).ok()?;
+    Some(exe_dir)
 }

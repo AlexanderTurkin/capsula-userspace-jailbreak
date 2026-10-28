@@ -67,20 +67,17 @@ pub const PACKAGE_330E: Package = Package {
 /// adb keeps working through any installed Android/Google WinUSB driver.
 pub const PACKAGES: &[&Package] = &[&PACKAGE_330D, &PACKAGE_330E];
 
-/// Name of the hidden elevated-helper subcommand of the CLI.
-pub const HELPER_ARG: &str = "__win-drv-helper";
-
 #[cfg(windows)]
 mod sys;
 
 #[cfg(windows)]
-pub use sys::{helper_main, Session};
+pub use sys::{fix_cwd_if_system32, pause_if_own_console, Session};
 
 #[cfg(not(windows))]
 mod stub;
 
 #[cfg(not(windows))]
-pub use stub::{helper_main, Session};
+pub use stub::{fix_cwd_if_system32, pause_if_own_console, Session};
 
 /// Does this error message look like "the devnode is bound to a wrong
 /// driver"? nusb reports a non-WinUSB binding as "incompatible driver
