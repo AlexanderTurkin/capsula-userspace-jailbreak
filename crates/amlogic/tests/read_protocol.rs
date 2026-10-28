@@ -398,3 +398,79 @@ fn store_size_rejects_unknown_partition_and_invalid_capacities() {
         assert!(session(steps).partition_readable_size("data").is_err());
     }
 }
+
+/// A live A113X can fill the whole staging range and still answer
+/// `failed:` when `nand read` skipped a bad block. The data is real and
+/// must not be discarded at the first stage.
+#[test]
+fn nand_range_keeps_a_full_stage_after_a_bad_block_status() {
+    let stage = 0x200usize;
+    let mut steps = armed("echo; mw.b 0x1080000 0xa5 0x200");
+    steps.push(Step::ControlOut(
+        req::BULKCMD,
+        0,
+        2,
+        command("echo; nand read 0x1080000 0x0 0x200"),
+    ));
+    steps.push(Step::BulkIn(b"failed:\0".to_vec()));
+    steps.extend(armed("upload mem 0x1080000 normal 0x200"));
+    steps.extend([
+        Step::ControlIn(req::READ_MEDIA, 4096, 1, head(stage as u32)),
+        Step::BulkIn(vec![0x42; stage]),
+    ]);
+    let mut s = session(steps);
+    let progress = RefCell::new(Vec::new());
+    let data = s
+        .read_nand_range(0, stage, &|done| progress.borrow_mut().push(done))
+        .unwrap();
+    assert_eq!(data, vec![0x42; stage]);
+    assert_eq!(*progress.borrow(), [stage]);
+    assert_eq!(s.transport().pos, s.transport().steps.len());
+}
+
+/// A failed status with an untouched sentinel tail is an actual short
+/// read: keep the prefix, not the 0xa5 padding.
+#[test]
+fn nand_range_truncates_a_failed_stage_at_the_sentinel_tail() {
+    let mut steps = armed("echo; mw.b 0x1080000 0xa5 0x200");
+    steps.push(Step::ControlOut(
+        req::BULKCMD,
+        0,
+        2,
+        command("echo; nand read 0x1080000 0x0 0x200"),
+    ));
+    steps.push(Step::BulkIn(b"failed:\0".to_vec()));
+    steps.extend(armed("upload mem 0x1080000 normal 0x200"));
+    let mut payload = vec![0x42; 0x100];
+    payload.extend(vec![0xa5; 0x100]);
+    steps.extend([
+        Step::ControlIn(req::READ_MEDIA, 4096, 1, head(0x200)),
+        Step::BulkIn(payload),
+    ]);
+    let mut s = session(steps);
+    let data = s.read_nand_range(0, 0x200, &|_| {}).unwrap();
+    assert_eq!(data, vec![0x42; 0x100]);
+}
+
+/// A failed status with no data in the buffer is a real failure, even
+/// at the start of the range.
+#[test]
+fn nand_range_failed_status_without_data_is_an_error() {
+    let mut steps = armed("echo; mw.b 0x1080000 0xa5 0x200");
+    steps.push(Step::ControlOut(
+        req::BULKCMD,
+        0,
+        2,
+        command("echo; nand read 0x1080000 0x0 0x200"),
+    ));
+    steps.push(Step::BulkIn(b"failed:\0".to_vec()));
+    steps.extend(armed("upload mem 0x1080000 normal 0x200"));
+    steps.extend([
+        Step::ControlIn(req::READ_MEDIA, 4096, 1, head(0x200)),
+        Step::BulkIn(vec![0xa5; 0x200]),
+    ]);
+    let mut s = session(steps);
+    let error = s.read_nand_range(0, 0x200, &|_| {}).unwrap_err();
+    assert!(error.to_string().contains("failed:"));
+    assert_eq!(s.transport().pos, s.transport().steps.len());
+}

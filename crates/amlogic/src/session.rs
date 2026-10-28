@@ -603,10 +603,13 @@ impl<T: Transport> AmlogicSession<T> {
     /// the host just consumes exactly what is announced).
     ///
     /// Error split: a `nand read` REJECTED by the device (`failed:`,
-    /// a bad block after the good prefix) truncates the result and
-    /// returns it; a TRANSPORT error is the session dying and
-    /// propagates to the caller, which reconnects and retries the same
-    /// range.
+    /// a bad block after the good prefix) does NOT necessarily mean the
+    /// staging buffer was not written: the live A113X gadget fills the
+    /// whole range and still answers `failed:` when it skipped a bad
+    /// block. The stage is uploaded in both cases and the sentinel tail
+    /// decides how much is real. A TRANSPORT error is the session dying
+    /// and propagates to the caller, which reconnects and retries the
+    /// same range.
     pub fn read_nand_range(
         &mut self,
         off: u32,
@@ -641,23 +644,14 @@ impl<T: Transport> AmlogicSession<T> {
                 "echo; mw.b {:#x} 0xa5 {stage:#x}",
                 crate::RAM_SCRATCH
             ))?;
-            if let Err(e) = self.nand_read(crate::RAM_SCRATCH, off + total as u32, stage) {
-                match e {
-                    // the device rejected the read after the good
-                    // prefix — the received data is the truth
-                    // (flasher.sh readable_size)
-                    Error::CommandFailed(_) if total > 0 => {
-                        log::warn!(
-                            "nand read rejected at {:#x} (+{total:#x} of {len:#x}): {e} \
-                             — keeping the prefix",
-                            off + total as u32
-                        );
-                        break;
-                    }
-                    // anything else is the session dying
-                    other => return Err(other),
-                }
-            }
+            // A bad-block `failed:` does not prove the buffer is empty:
+            // keep the status and upload the stage anyway.
+            let read_failure = match self.nand_read(crate::RAM_SCRATCH, off + total as u32, stage) {
+                Ok(()) => None,
+                Err(e @ Error::CommandFailed(_)) => Some(e),
+                // anything else is the session dying
+                Err(other) => return Err(other),
+            };
             // arm the whole stage once; the bursts below are paced by
             // the device (announced in the upload head)
             self.send_bulk_cmd(&format!(
@@ -689,20 +683,66 @@ impl<T: Transport> AmlogicSession<T> {
                 }
                 out[total + staged..total + staged + chunk.len()].copy_from_slice(&chunk);
                 staged += chunk.len();
-                progress(total + staged);
             }
-            total += staged;
-            if staged < stage {
-                break; // stopped mid-stage
+
+            // The staging buffer was pre-filled with 0xa5. If the read
+            // stopped early, the untouched tail still holds it; a full
+            // buffer (even after `failed:`) is real data.
+            let untouched = out[total..total + staged]
+                .iter()
+                .rev()
+                .take_while(|&&b| b == 0xa5)
+                .count();
+            let valid = staged - untouched;
+            if let Some(error) = read_failure {
+                if valid == 0 {
+                    if stop() {
+                        break;
+                    }
+                    if total == 0 {
+                        return Err(error);
+                    }
+                    log::warn!(
+                        "nand read rejected at {:#x} (+{total:#x} of {len:#x}): {error} \
+                         — keeping the prefix",
+                        off + total as u32
+                    );
+                    break;
+                }
+                if valid == stage {
+                    log::warn!(
+                        "nand read at {:#x} reported {error} but staged the whole \
+                         {stage:#x}-byte block; keeping it",
+                        off + total as u32
+                    );
+                } else {
+                    log::warn!(
+                        "nand read rejected at {:#x}: keeping {valid:#x} of {staged:#x} \
+                         staged bytes ({error})",
+                        off + total as u32
+                    );
+                }
+                total += valid;
+                progress(total);
+                if valid < staged {
+                    break;
+                }
+                continue;
             }
-            // the sentinel survived the read: the NAND did not replace
-            // the staging buffer (usb_pcd/flasher.sh guard)
-            if out[total - stage..total].iter().all(|&b| b == 0xa5) {
+
+            // a successful read that left the sentinel untouched did
+            // not happen at all (usb_pcd/flasher.sh guard)
+            if staged == stage && out[total..total + stage].iter().all(|&b| b == 0xa5) {
                 return Err(Error::Usb(format!(
                     "nand read {:#x}: the staging buffer still holds the sentinel — \
                      the read did not happen",
-                    off + (total - stage) as u32
+                    off + total as u32
                 )));
+            }
+            total += staged;
+            progress(total);
+            if staged < stage {
+                break; // stopped mid-stage
             }
         }
         out.truncate(total);

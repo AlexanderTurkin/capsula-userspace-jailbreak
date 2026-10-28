@@ -50,8 +50,11 @@ pub struct DumpState {
     pub off: u32,
     pub size: usize,
     pub data: Vec<u8>,
-    /// Set when a `nand read` failed mid-partition: the received prefix
-    /// is the truth (bad blocks; flasher.sh `readable_size`).
+    /// Set when the staging buffer kept part of the 0xa5 sentinel: the
+    /// received prefix is the truth (bad blocks; flasher.sh
+    /// `readable_size`). A `failed:` status with a fully staged block is
+    /// not a short read — the live gadget fills the whole range and
+    /// still reports the bad block it skipped.
     pub short_read: bool,
 }
 
